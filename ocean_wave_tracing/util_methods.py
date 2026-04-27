@@ -21,7 +21,7 @@ def make_xarray_dataArray(var,t,rays,name,attribs):
     return vo
 
 
-def to_xarray_ds(v,latlon=False):
+def to_xarray_ds(v):
     """
     Return xarray Dataset (ds) object
     """
@@ -52,6 +52,7 @@ def check_velocity_field(U,temporal_evolution,x,y):
     """
 
     time_flag = False
+    is_spherical = False
 
     if not type(U) == xa.DataArray:
         U_out = xa.DataArray(data=U,
@@ -66,8 +67,17 @@ def check_velocity_field(U,temporal_evolution,x,y):
         if 'time' in U.dims:
             time_flag = True
 
-        assert 'x' in U.dims, "Velocity field is using wrong x-dimension. Please rename by U.rename({'XDIM':'x'})"
-        assert 'y' in U.dims, "Velocity field is using wrong y-dimension. Please rename by U.rename({'YDIM':'y'})"
+        # Check if dataset follows lat/lon
+        if ('lon' in U.dims) or ('lat' in U.dims):
+            assert 'lon' in U.dims, "Velocity field is using wrong x-dimension. Please rename by U.rename({'XDIM':'lon'})"
+            assert 'lat' in U.dims, "Velocity field is using wrong y-dimension. Please rename by U.rename({'YDIM':'lat'})"
+            is_spherical = True
+
+
+        # Alternatively, choose cartesian coordinates
+        else:
+            assert 'x' in U.dims, "Velocity field is using wrong x-dimension. Please rename by U.rename({'XDIM':'x'})"
+            assert 'y' in U.dims, "Velocity field is using wrong y-dimension. Please rename by U.rename({'YDIM':'y'})"
         U_out = U
 
     if not time_flag:
@@ -75,9 +85,9 @@ def check_velocity_field(U,temporal_evolution,x,y):
 
     assert 'time' in U_out.dims, "Velocity field is missing time dimension."
 
-    return U_out
+    return U_out, is_spherical
 
-def check_bathymetry(d,x,y):
+def check_bathymetry(d,x,y,is_spherical=False):
     """ Method checking and fixing bathymetry input
 
     Args:
@@ -98,16 +108,25 @@ def check_bathymetry(d,x,y):
     d[d==0] = np.nan
 
     if not type(d) == xa.DataArray:
-        d = xa.DataArray(data=d,
-                         dims=['y','x'],
-                         coords=dict(
-                                x=(['x'], x),
-                                y=(['y'], y),
-                                )
-                        )
+        if is_spherical:
+            d = xa.DataArray(data=d,
+                            dims=['lat','lon'],
+                            coords=dict(
+                                    x=(['lon'], x),
+                                    y=(['lat'], y),
+                                    )
+                            )
+        else:
+            d = xa.DataArray(data=d,
+                            dims=['y','x'],
+                            coords=dict(
+                                    x=(['x'], x),
+                                    y=(['y'], y),
+                                    )
+                            )
     return(d)
 
-def check_WKB_valitidy_depht(k,d,dx):
+def check_WKB_validity_depth(k,d,dx):
     """
     Method for checking the validity of the geometric optics approximation for depth-inuced 
     refraction within the domain

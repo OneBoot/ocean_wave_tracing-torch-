@@ -23,6 +23,11 @@ class Wave_tracing():
     """ Class computing the path of ocean wave rays according to the geometrical
     optics approximation.
     """
+
+    # ---------------------------------------------------------------------------------------------------------------
+    # --------------------------------------------- SPHERICAL DDDX, DDDY --------------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
+
     def __init__(self, U, V,  nx, ny, nt, T, dx, dy,
                  nb_wave_rays, domain_X0, domain_XN, domain_Y0, domain_YN,
                  temporal_evolution=False,
@@ -35,7 +40,7 @@ class Wave_tracing():
             ny (int): number of points in y-direction of velocity domain
             nt (int): number of time steps for computation
             T (int): Seconds. Duration of wave tracing
-            dx (int): Spatial resolution in x-direction. Units conforming to U
+            dx (int): Spatial resolution in x-direction. Units conforming to U (is this an array?)
             dy (int): Spatial resolution in y-direction. Units conforming to V
             nb_wave_rays (int): Number of wave rays to track.
             domain_*0 (float): start value of domain area in X and Y direction
@@ -44,7 +49,10 @@ class Wave_tracing():
             d (float): 2D bathymetry field
             **kwargs
         """
-        self.g = 9.81
+        self.g = 9.81 # Gravitational constant
+
+        self.is_spherical = False #Flag that determines behavior of gradient everywhere
+
         self.nx = nx
         self.ny = ny
         self.nt = nt
@@ -104,8 +112,8 @@ class Wave_tracing():
         self.d_cx = np.ma.zeros((nb_wave_rays,nt))
         
         # make xarray DataArray of velocity field
-        self.U = check_velocity_field(U,temporal_evolution,x=self.x,y=self.y)
-        self.V = check_velocity_field(V,temporal_evolution,x=self.x,y=self.y)
+        self.U, self.is_spherical = check_velocity_field(U,temporal_evolution,x=self.x,y=self.y)
+        self.V, _ = check_velocity_field(V,temporal_evolution,x=self.x,y=self.y)
 
         # Time
         self.dt = T/nt
@@ -120,6 +128,11 @@ class Wave_tracing():
             self.velocity_idt = np.array([self.find_nearest(t_velocity_field,t_wr[i]) for i in range(len(t_wr))])
 
         self.kwargs = kwargs
+
+        #Helper to find out how to treat the attributes
+        print("\nAttribute types:")
+        for attr, value in self.__dict__.items():
+            print(f"{attr}: {type(value)}")
 
 
     def check_CFL(self, cg, max_speed):
@@ -142,7 +155,7 @@ class Wave_tracing():
             logger.warning('Courant number is {}'.format(np.round(C,2)))
 
         self.C = C
-
+    
 
     def find_nearest(self,array, value):
         """ Method finding nearest indices to a position in array
@@ -159,7 +172,7 @@ class Wave_tracing():
         idx = (np.abs(array - value)).argmin()
         return idx
 
-
+    #Need not change
     def c_intrinsic(self,k,d,group_velocity=False):
         """ Computing the intrinsic wave phase and group velocity according
         to the general dispersion relation
@@ -190,6 +203,7 @@ class Wave_tracing():
         else:
             return c_in
 
+
     def sigma(self,k,d):
         """ Intrinsic frequency dispersion relation
 
@@ -204,7 +218,8 @@ class Wave_tracing():
         g=self.g
         sigma = np.sqrt(g*k*np.tanh(k*d))
         return sigma
-
+  
+    # Need not change
     def dsigma_x(self,k,idxs,idys,ray_depths):
         """ Compute the gradient of sigma in the x-direction due to
         the bathymetry.
@@ -212,9 +227,12 @@ class Wave_tracing():
         #ray_depths = self.d.isel(y=xa.DataArray(idys,dims='z'),x=xa.DataArray(idxs,dims='z'))
         #nabla_d_rays = self.dddx.isel(y=xa.DataArray(idys,dims='z'),x=xa.DataArray(idxs,dims='z'))
         kd = k*ray_depths
+
+        # nabla_d_rays also does not change
         nabla_d_rays = self.dddx.values[idys,idxs]
         dsigma = 0.5*k*np.sqrt((self.g*k) / np.tanh(kd)) * (1-(np.tanh(kd))**2) *nabla_d_rays
         return dsigma
+
 
     def dsigma_y(self,k,idxs,idys,ray_depths):
         """ Compute the gradient of sigma in the y-direction due to
@@ -226,6 +244,7 @@ class Wave_tracing():
         dsigma = 0.5*k*np.sqrt((self.g*k) / np.tanh(kd)) * (1-(np.tanh(kd))**2) *nabla_d_rays
         return dsigma
 
+
     def grad_c_x(self,k,idxs,idys,ray_depths):
         """ Compute the phase speed gradient in x-direction 
         """
@@ -234,7 +253,7 @@ class Wave_tracing():
         nabla_c = 0.5*np.sqrt((self.g*k) / np.tanh(kd)) * (1-(np.tanh(kd))**2) *nabla_d_rays
         return nabla_c
         
- 
+
     def grad_c_y(self,k,idxs,idys,ray_depths):
         """ Compute the phase speed gradient in y-direction 
         """
@@ -243,6 +262,10 @@ class Wave_tracing():
         nabla_c = 0.5*np.sqrt((self.g*k) / np.tanh(kd)) * (1-(np.tanh(kd))**2) *nabla_d_rays
         return nabla_c
 
+
+    # ---------------------------------------------------------------------------------------------------------------
+    # ------------------------------------------CHANGE; SEE K_IMP ESPECIALLY-----------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
 
     def wave(self,T,theta,d,U=0,V=0):
         """ Method computing wave number from initial wave period.
@@ -396,7 +419,9 @@ class Wave_tracing():
         #Check the CFL condition
         self.check_CFL(cg=np.nanmax(self.ray_cg[:,0]),max_speed=np.nanmax(np.sqrt(self.U**2+self.V**2)))
 
-
+    # ---------------------------------------------------------------------------------------------------------------
+    # ----------------------------------------CHANGE SELF.U.DIFFERENTIATE; RAYS--------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
     def solve(self, solver=RungeKutta4):
         """ Solve the geometrical optics equations numerically by means of the
             method of characteristics
@@ -462,10 +487,18 @@ class Wave_tracing():
             ray_cg[:,n] = self.c_intrinsic(ray_k[:,n],d=ray_depth,group_velocity=True)
 
             # ADVECTION
-            f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_kx[:,n], U=U[velocity_idt[n],idys,idxs])
+            if self.is_spherical:
+                f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_kx[:,n], U=U[velocity_idt[n],idys,idxs], 
+                                  y=ray_y[:,n], sph_coord="lon")
+            else:
+                f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_kx[:,n], U=U[velocity_idt[n],idys,idxs])
             ray_x[:,n+1] = solver.advance(u=ray_x[:,n], f=f_adv,k=n,t=t) # NOTE: this k is a counter and not wave number
 
-            f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_ky[:,n], U=V[velocity_idt[n],idys,idxs])
+            if self.is_spherical:
+                f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_ky[:,n], U=V[velocity_idt[n],idys,idxs],
+                                  y=ray_y[:,n], sph_coord="lat")
+            else:
+                f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_ky[:,n], U=V[velocity_idt[n],idys,idxs])
             ray_y[:,n+1] = solver.advance(u=ray_y[:,n], f=f_adv, k=n, t=t)# NOTE: this k is a counter and not wave number
 
 
@@ -473,15 +506,23 @@ class Wave_tracing():
             self.dsigma_dx[:,n] = self.dsigma_x(ray_k[:,n], idxs, idys,ray_depth)
             self.dsigma_dy[:,n] = self.dsigma_y(ray_k[:,n], idxs, idys,ray_depth)
 
-            f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dx[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
-                                               dUkx=self.ray_dudx[:,n], 
-                                               dUky=self.ray_dvdx[:,n])
+            if self.is_spherical:
+                f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dx[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
+                                               dUkx=self.ray_dudx[:,n], dUky=self.ray_dvdx[:,n],
+                                               cg = ray_cg[:n], y=ray_y[:,n], k=ray_k[:,n], U=self.ray_U, sph_coord="lon")
+            else:
+                f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dx[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
+                                                dUkx=self.ray_dudx[:,n], dUky=self.ray_dvdx[:,n])
             
             ray_kx[:,n+1] = solver.advance(u=ray_kx[:,n], f=f_wave_nb,k=n, t=t)# NOTE: this "k" is a counter and not wave number
 
-            f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dy[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
-                                               dUkx=self.ray_dudy[:,n], 
-                                               dUky=self.ray_dvdy[:,n])
+            if self.is_spherical:
+                f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dy[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
+                                                dUkx=self.ray_dudy[:,n], dUky=self.ray_dvdy[:,n],
+                                                cg = ray_cg[:n], y=ray_y[:,n], k=ray_k[:,n], U=self.ray_U, sph_coord="lat")
+            else:
+                f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dy[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
+                                                dUkx=self.ray_dudy[:,n], dUky=self.ray_dvdy[:,n])
             
             ray_ky[:,n+1] = solver.advance(u=ray_ky[:,n], f=f_wave_nb, k=n, t=t)# NOTE: this "k" is a counter and not wave number
 
@@ -538,6 +579,10 @@ class Wave_tracing():
         self.ray_cg = ray_cg
         logging.info('Stoppet at time idt: {}'.format(velocity_idt[n]))
 
+    # ---------------------------------------------------------------------------------------------------------------
+    # ---------------------------------------------TO_LATLON UNNESCESSARY--------------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
+
     def to_ds(self,**kwargs):
         """Convert wave ray information to xarray object"""
 
@@ -557,7 +602,7 @@ class Wave_tracing():
                     'ray_theta':self.ray_theta,
                     'ray_cg':self.ray_cg,
                     'ray_depth':self.ray_depth,
-                    'ray_lat': lats,
+                    'ray_lat':lats,
                     'ray_lon':lons,
                     'ray_dudx':self.ray_dudx,
                     'ray_dvdy':self.ray_dvdy,
@@ -620,6 +665,10 @@ class Wave_tracing():
             plt.scatter(xx,yy);plt.show()
 
         return xx,yy,hm
+    
+    # ---------------------------------------------------------------------------------------------------------------
+    # -----------------------------------------------------IGNORE?---------------------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
 
     def to_latlon(self, proj4):
         """ Method for reprojecting wave rays to latitude/longitude values
@@ -638,6 +687,10 @@ class Wave_tracing():
             lons[i,:],lats[i,:] = pyproj.Transformer.from_proj(proj4,'epsg:4326', always_xy=True).transform(self.ray_x[i,:], self.ray_y[i,:])
 
         return lons, lats
+    
+    # ---------------------------------------------------------------------------------------------------------------
+    # -------------------------------------------------NEED MORE INFO------------------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
     
     def get_ray_curvature(self,decomposed=False):
         """ Compute the approximate analytical ray curvature after Halsne and Li (2025, in rev.)
@@ -668,6 +721,10 @@ class Wave_tracing():
             return ray_curvature_tot, ray_curvature_depth, ray_curvature_curr
         else:
             return ray_curvature_tot
+
+    # ---------------------------------------------------------------------------------------------------------------
+    # -------------------------------------------------NEED MORE INFO------------------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
 
     def get_shoaling_coefficient(self):
         """ Compute the shoaling coefficient due to group velocity changes

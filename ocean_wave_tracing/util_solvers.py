@@ -1,18 +1,40 @@
 
+R = 6.371e6 # Average radius of earth
+
 class Advection():
     #def set_variables(self, cg, k, kx, U):
-    def __init__(self, cg, k, kx, U):
+    def __init__(self, cg, k, kx, U, is_spherical=False, sph_coord="lon"):
+
+        #if spherical, assumes that cg is already in the corresponding spherical form
         #cg, k, kx, U = self.cg, self.k, self.kx, self.U
         self.cg = cg
         self.k = k
         self.kx = kx
         self.U = U
 
+        #Arguments determining if cartesian or spherical framework is employed
+        self.is_spherical = is_spherical
+        self.sph_coord = sph_coord
+
+    # ---------------------------------------------------------------------------------------------------------------
+    # -----------------------------------------NEEDS TO BE SPLIT INTO LAT/LON----------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
+
     def __call__(self,u,t):
         cg, k, kx, U = self.cg, self.k, self.kx, self.U
 
-        #f = [cg*(kx/k) + U]
-        f = cg*(kx/k) + U
+        if self.is_spherical:
+            y = self.y
+            f = cg*(kx/k) + U
+            if self.sph_coord == "lon":
+                f = f / (R*np.cos(np.deg2rad(y)))
+            elif self.sph_coord == "lat":
+                f = f / R
+            else: raise ValueError('sph_coord must be either "lon" or "lat" but is %s' % self.sph_coord)
+            
+        else:  #cartesian case
+            #f = [cg*(kx/k) + U]
+            f = cg*(kx/k) + U
         return f
 
 class WaveNumberEvolution():
@@ -23,11 +45,28 @@ class WaveNumberEvolution():
         self.dUkx = dUkx
         self.dUky = dUky
 
+    # ---------------------------------------------------------------------------------------------------------------
+    # -----------------------------------------NEEDS TO BE SPLIT INTO LAT/LON----------------------------------------
+    # ---------------------------------------------------------------------------------------------------------------  
+
     def __call__(self, u, t):
         d_sigma, kx, ky, dUkx, dUky = self.d_sigma, self.kx, self.ky, self.dUkx, self.dUky
 
-        #f = [d_sigma + kx*dUkx + ky*dUky]
-        f = -(d_sigma + kx*dUkx + ky*dUky)
+        if self.is_spherical:
+            cg = self.cg
+            y = self.y
+            U = self.U
+            if self.sph_coord == "lon":
+                f = -(d_sigma + (kx*dUkx/(R*np.cos(y))) + (ky*dUky/R))
+            elif self.sph_coord == "lat":
+                f = -(d_sigma + (cg*(kx**2)*np.tan(y)/k) 
+                      (kx*((dUkx/np.cos(y))+(U*np.sin(y)*np.tan(y))))/R + ky*dUky/R)
+
+            else: raise ValueError('sph_coord must be either "lon" or "lat" but is %s' % self.sph_coord)
+            
+        else:  #cartesian case
+            #f = [d_sigma + kx*dUkx + ky*dUky]
+            f = -(d_sigma + kx*dUkx + ky*dUky)
         return f
 
 
