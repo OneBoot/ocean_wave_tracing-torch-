@@ -1,9 +1,10 @@
+import numpy as np
 
 R = 6.371e6 # Average radius of earth
 
 class Advection():
     #def set_variables(self, cg, k, kx, U):
-    def __init__(self, cg, k, kx, U, is_spherical=False, sph_coord="lon"):
+    def __init__(self, cg, k, kx, U, is_spherical=False, **kwargs):
 
         #if spherical, assumes that cg is already in the corresponding spherical form
         #cg, k, kx, U = self.cg, self.k, self.kx, self.U
@@ -14,7 +15,13 @@ class Advection():
 
         #Arguments determining if cartesian or spherical framework is employed
         self.is_spherical = is_spherical
-        self.sph_coord = sph_coord
+        if self.is_spherical:
+            try:
+                self.sph_coord = kwargs.get("sph_coord")
+                self.y = kwargs.get("y")
+                self.theta = kwargs.get("theta")
+            except:
+                raise TypeError("missing required arguments; sph_coord and/or y")
 
     # ---------------------------------------------------------------------------------------------------------------
     # -----------------------------------------NEEDS TO BE SPLIT INTO LAT/LON----------------------------------------
@@ -25,11 +32,12 @@ class Advection():
 
         if self.is_spherical:
             y = self.y
+            theta = self.theta
             f = cg*(kx/k) + U
             if self.sph_coord == "lon":
-                f = f / (R*np.cos(np.deg2rad(y)))
+                f = (cg*np.cos(theta)+U) / (R*np.cos(y))
             elif self.sph_coord == "lat":
-                f = f / R
+                f = (cg*np.sin(theta)+U) / R
             else: raise ValueError('sph_coord must be either "lon" or "lat" but is %s' % self.sph_coord)
             
         else:  #cartesian case
@@ -38,12 +46,24 @@ class Advection():
         return f
 
 class WaveNumberEvolution():
-    def __init__(self,d_sigma, kx, ky, dUkx, dUky):
+    def __init__(self,d_sigma, kx, ky, dUkx, dUky, is_spherical=False, **kwargs):
         self.d_sigma = d_sigma
         self.kx = kx
         self.ky = ky
         self.dUkx = dUkx
         self.dUky = dUky
+
+        self.is_spherical = is_spherical
+        if self.is_spherical:
+            try:
+                self.sph_coord = kwargs.get("sph_coord")
+                self.cg = kwargs.get("cg")
+                self.y = kwargs.get("y")
+                self.k = kwargs.get("k")
+                self.U = kwargs.get("U")
+                self.theta = kwargs.get("theta")
+            except:
+                raise TypeError("missing required arguments; sph_coord, k, U and/or y")
 
     # ---------------------------------------------------------------------------------------------------------------
     # -----------------------------------------NEEDS TO BE SPLIT INTO LAT/LON----------------------------------------
@@ -54,13 +74,16 @@ class WaveNumberEvolution():
 
         if self.is_spherical:
             cg = self.cg
-            y = self.y
+            y = self.y #np.deg2rad(self.y)
+            theta = self.theta
+            k = self.k
             U = self.U
+            #print(np.mean(kx), np.mean(k), np.mean(R*np.cos(y)))
             if self.sph_coord == "lon":
                 f = -(d_sigma + (kx*dUkx/(R*np.cos(y))) + (ky*dUky/R))
             elif self.sph_coord == "lat":
-                f = -(d_sigma + (cg*(kx**2)*np.tan(y)/k) 
-                      (kx*((dUkx/np.cos(y))+(U*np.sin(y)*np.tan(y))))/R + ky*dUky/R)
+                f = -(d_sigma + (cg*k*(np.cos(theta)**2)*np.tan(y)) +
+                      ((((np.cos(y)*dUky)+(U*np.sin(y)))/(np.cos(y)**2))*kx/R) + ky*dUky/R)
 
             else: raise ValueError('sph_coord must be either "lon" or "lat" but is %s' % self.sph_coord)
             

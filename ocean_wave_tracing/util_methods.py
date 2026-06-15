@@ -146,4 +146,4 @@ def check_WKB_validity_depth(k,d,dx):
     grad_d_over_d = np.abs(np.gradient(d,dx,edge_order=1)/d)
     criteria = grad_d_over_d/k
 
-    return criteria_xy
+    return criteria

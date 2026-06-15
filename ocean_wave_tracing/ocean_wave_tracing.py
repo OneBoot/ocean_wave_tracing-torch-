@@ -10,7 +10,7 @@ import json
 #from importlib import resources
 from importlib_resources import files, as_file
 
-from .util_solvers import Advection, WaveNumberEvolution, RungeKutta4
+from .util_solvers import Advection, WaveNumberEvolution, RungeKutta4, R
 from .util_methods import make_xarray_dataArray, to_xarray_ds, check_velocity_field, check_bathymetry
 
 
@@ -30,7 +30,7 @@ class Wave_tracing():
 
     def __init__(self, U, V,  nx, ny, nt, T, dx, dy,
                  nb_wave_rays, domain_X0, domain_XN, domain_Y0, domain_YN,
-                 temporal_evolution=False,
+                 temporal_evolution=False, is_spherical=False,
                  d=None,DEBUG=False,**kwargs):
         """
         Args:
@@ -51,7 +51,7 @@ class Wave_tracing():
         """
         self.g = 9.81 # Gravitational constant
 
-        self.is_spherical = False #Flag that determines behavior of gradient everywhere
+        self.is_spherical = is_spherical #Flag that determines behavior of gradient everywhere
 
         self.nx = nx
         self.ny = ny
@@ -75,17 +75,25 @@ class Wave_tracing():
         self.x = np.linspace(domain_X0, domain_XN, nx)
         self.y = np.linspace(domain_Y0, domain_YN, ny)
 
+        #----------print("pre-check d: ", d)
+
         # Check the bathymetry
         if d is not None:
-            self.d = check_bathymetry(d=d,x=self.x,y=self.y)
+            self.d = check_bathymetry(d=d,x=self.x,y=self.y,is_spherical=self.is_spherical)
         else:
             d_static = 1e5
             logging.info(f'Hardcoding bathymetry to {d_static}m since not given.')
             self.d = check_bathymetry(d=np.ones((ny,nx))*d_static,x=self.x,y=self.y)
 
+        #-----------print("self.d: ", self.d)
+
         # Computing the horizontal gradients of the bathymetry
         self.dddx = self.d.differentiate(coord='x',edge_order=2)
         self.dddy = self.d.differentiate(coord='y',edge_order=2)
+
+        if self.is_spherical:
+            self.dddx = self.dddx*np.pi/180
+            self.dddy = self.dddy*np.pi/180
 
         # Setting up the wave rays
         self.ray_x = np.zeros((nb_wave_rays,nt))
@@ -112,7 +120,7 @@ class Wave_tracing():
         self.d_cx = np.ma.zeros((nb_wave_rays,nt))
         
         # make xarray DataArray of velocity field
-        self.U, self.is_spherical = check_velocity_field(U,temporal_evolution,x=self.x,y=self.y)
+        self.U, _ = check_velocity_field(U,temporal_evolution,x=self.x,y=self.y) #self.is_spherical
         self.V, _ = check_velocity_field(V,temporal_evolution,x=self.x,y=self.y)
 
         # Time
@@ -130,9 +138,9 @@ class Wave_tracing():
         self.kwargs = kwargs
 
         #Helper to find out how to treat the attributes
-        print("\nAttribute types:")
-        for attr, value in self.__dict__.items():
-            print(f"{attr}: {type(value)}")
+        #print("\nAttribute types:")
+        #for attr, value in self.__dict__.items():
+        #    print(f"{attr}: {type(value)}")
 
 
     def check_CFL(self, cg, max_speed):
@@ -295,6 +303,10 @@ class Wave_tracing():
         alpha = k0*d
         k_approx = (alpha/np.sqrt(np.tanh(alpha)))/d
 
+        #----------print("d: ", d)
+        #----------print("sigma: ", sigma)
+        #----------print("alpha: ", alpha)
+
         from scipy.optimize import fsolve
 
         def k_imp(kk, d=d, g=g,T=T,U=U,V=V):
@@ -302,7 +314,7 @@ class Wave_tracing():
             ky_ap = kk*np.sin(theta)
             return (np.sqrt((g*kk * np.tanh(kk*d)))+ kx_ap*U + ky_ap*V ) - (2*np.pi)/T 
         
-        
+        #----------print("k_approx: ",k_approx)
         k = fsolve(k_imp,k_approx)
         k = k.squeeze()
 
@@ -402,8 +414,22 @@ class Wave_tracing():
             logger.error('Theta0 must be either float or numpy array. Terminating.')
             sys.exit()
 
+## ISSUE TRACED HERE; d.sel not working
 
         # set inital wave properties
+        #if self.is_spherical:
+        #    for i in range(nb_wave_rays):
+        #        print("ys = ", ys[i], ", xs = ", xs[i])
+        #        self.ray_k[i,0], self.ray_kx[i,0], self.ray_ky[i,0] = self.wave(T=wave_period,
+        #                                                            theta=theta0[i],
+        #                                                            d=self.d.sel(y=ys[i],x=xs[i],method='nearest').values,
+        #                                                            U=self.U.isel(time=self.velocity_idt[i]).sel(lat=ys[i],lon=xs[i],method='nearest').values,
+        #                                                            V=self.V.isel(time=self.velocity_idt[i]).sel(lat=ys[i],lon=xs[i],method='nearest').values
+        #                                                            )
+        #        print("sel: ", self.d.sel(y=ys[i],x=xs[i],method='nearest').values)
+        #        print("ray: ", self.ray_k[i,0])
+        #        self.ray_cg[i,0] = self.c_intrinsic(k=self.ray_k[i,0],d=self.d.sel(y=ys[i],x=xs[i],method='nearest'),group_velocity=True)
+        #else:
         for i in range(nb_wave_rays):
             self.ray_k[i,0], self.ray_kx[i,0], self.ray_ky[i,0] = self.wave(T=wave_period,
                                                                 theta=theta0[i],
@@ -426,6 +452,7 @@ class Wave_tracing():
         """ Solve the geometrical optics equations numerically by means of the
             method of characteristics
         """
+        print(self.is_spherical)
 
         if not callable(solver):
             raise TypeError('f is %s, not a solver' % type(solver))
@@ -488,15 +515,15 @@ class Wave_tracing():
 
             # ADVECTION
             if self.is_spherical:
-                f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_kx[:,n], U=U[velocity_idt[n],idys,idxs], 
-                                  y=ray_y[:,n], sph_coord="lon")
+                f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_kx[:,n], U=U[velocity_idt[n],idys,idxs], is_spherical=True, 
+                                  y=ray_y[:,n], theta = ray_theta[:,n], sph_coord="lon")
             else:
                 f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_kx[:,n], U=U[velocity_idt[n],idys,idxs])
-            ray_x[:,n+1] = solver.advance(u=ray_x[:,n], f=f_adv,k=n,t=t) # NOTE: this k is a counter and not wave number
+            ray_x[:,n+1] = solver.advance(u=ray_x[:,n], f=f_adv, k=n, t=t) # NOTE: this k is a counter and not wave number
 
             if self.is_spherical:
-                f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_ky[:,n], U=V[velocity_idt[n],idys,idxs],
-                                  y=ray_y[:,n], sph_coord="lat")
+                f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_ky[:,n], U=V[velocity_idt[n],idys,idxs], is_spherical=True,
+                                  y=ray_y[:,n], theta = ray_theta[:,n], sph_coord="lat")
             else:
                 f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_ky[:,n], U=V[velocity_idt[n],idys,idxs])
             ray_y[:,n+1] = solver.advance(u=ray_y[:,n], f=f_adv, k=n, t=t)# NOTE: this k is a counter and not wave number
@@ -508,8 +535,9 @@ class Wave_tracing():
 
             if self.is_spherical:
                 f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dx[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
-                                               dUkx=self.ray_dudx[:,n], dUky=self.ray_dvdx[:,n],
-                                               cg = ray_cg[:n], y=ray_y[:,n], k=ray_k[:,n], U=self.ray_U, sph_coord="lon")
+                                               dUkx=self.ray_dudx[:,n], dUky=self.ray_dvdx[:,n], is_spherical=True,
+                                               cg = ray_cg[:,n], y=ray_y[:,n], k=ray_k[:,n], U=U[velocity_idt[n],idys,idxs], 
+                                               theta = ray_theta[:,n], sph_coord="lon")
             else:
                 f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dx[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
                                                 dUkx=self.ray_dudx[:,n], dUky=self.ray_dvdx[:,n])
@@ -518,8 +546,9 @@ class Wave_tracing():
 
             if self.is_spherical:
                 f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dy[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
-                                                dUkx=self.ray_dudy[:,n], dUky=self.ray_dvdy[:,n],
-                                                cg = ray_cg[:n], y=ray_y[:,n], k=ray_k[:,n], U=self.ray_U, sph_coord="lat")
+                                                dUkx=self.ray_dudy[:,n], dUky=self.ray_dvdy[:,n], is_spherical=True,
+                                                cg = ray_cg[:,n], y=ray_y[:,n], k=ray_k[:,n], U=U[velocity_idt[n],idys,idxs], 
+                                                theta = ray_theta[:,n], sph_coord="lat")
             else:
                 f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dy[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
                                                 dUkx=self.ray_dudy[:,n], dUky=self.ray_dvdy[:,n])
@@ -527,10 +556,16 @@ class Wave_tracing():
             ray_ky[:,n+1] = solver.advance(u=ray_ky[:,n], f=f_wave_nb, k=n, t=t)# NOTE: this "k" is a counter and not wave number
 
             # Compute wave number k
-            ray_k[:,n+1] = np.sqrt(ray_kx[:,n+1]**2+ray_ky[:,n+1]**2)
+            if self.is_spherical:
+                ray_k[:,n+1] = np.sqrt((ray_kx[:,n+1]/np.cos(ray_y[:,n+1]))**2 
+                                       +ray_ky[:,n+1]**2)/R
+                ray_theta[:,n+1] = np.arctan2(ray_ky[:,n+1],ray_kx[:,n+1]/np.cos(ray_y[:,n+1]))
+            else:
+                ray_k[:,n+1] = np.sqrt(ray_kx[:,n+1]**2+ray_ky[:,n+1]**2)
+                ray_theta[:,n+1] = np.arctan2(ray_ky[:,n+1],ray_kx[:,n+1])
 
             # THETA
-            ray_theta[:,n+1] = np.arctan2(ray_ky[:,n+1],ray_kx[:,n+1])
+            
 
             #keep angles between 0 and 2pi
             ray_theta[:,n+1] = np.mod(ray_theta[:,n+1],(2*np.pi))
