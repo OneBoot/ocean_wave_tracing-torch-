@@ -1,17 +1,18 @@
 name: wave_tracing
 channels:
   - conda-forge
+  - nodefaults
 dependencies:
-  - python>=3.7
-  - matplotlib>=3.1
-  - numpy>=1.17
-  - scipy>=1.2
+  - python>=3.12
+  - matplotlib
+  - numpy
+  - scipy
   - netcdf4
   - xarray
-  - pyproj>=2.3
+  - pyproj
   - cartopy
   - pip
-  - yaml
+  - pyyaml
   - ipython
   - cmocean
   - jupyterlab

@@ -33,7 +33,6 @@ class Advection():
         if self.is_spherical:
             y = self.y
             theta = self.theta
-            f = cg*(kx/k) + U
             if self.sph_coord == "lon":
                 f = (cg*np.cos(theta)+U) / (R*np.cos(y))
             elif self.sph_coord == "lat":
@@ -74,7 +73,8 @@ class WaveNumberEvolution():
 
         if self.is_spherical:
             cg = self.cg
-            y = self.y #np.deg2rad(self.y)
+            y = self.y 
+            #np.deg2rad(self.y)
             theta = self.theta
             k = self.k
             U = self.U
@@ -82,8 +82,12 @@ class WaveNumberEvolution():
             if self.sph_coord == "lon":
                 f = -(d_sigma + (kx*dUkx/(R*np.cos(y))) + (ky*dUky/R))
             elif self.sph_coord == "lat":
+#                print("inside method: [", d_sigma, (cg*k*(np.cos(theta)**2)*np.tan(y)),
+ #                     ((((np.cos(y)*dUkx), (U*np.sin(y)))/(np.cos(y)**2))*kx/R), ky*dUky/R, "]")
+  #              print("single values: [", cg, k, (np.cos(theta)**2), np.tan(y), "]")
                 f = -(d_sigma + (cg*k*(np.cos(theta)**2)*np.tan(y)) +
-                      ((((np.cos(y)*dUky)+(U*np.sin(y)))/(np.cos(y)**2))*kx/R) + ky*dUky/R)
+                      ((((np.cos(y)*dUkx)+(U*np.sin(y)))/(np.cos(y)**2))*kx/R) 
+                      + ky*dUky/R)
 
             else: raise ValueError('sph_coord must be either "lon" or "lat" but is %s' % self.sph_coord)
             

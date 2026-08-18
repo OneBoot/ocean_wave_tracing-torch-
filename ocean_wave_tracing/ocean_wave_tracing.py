@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(filename='ocean_wave_tracing.log', level=logging.INFO)
 logging.info('\nStarted')
 
+R = 6.371e6
 
 class Wave_tracing():
     """ Class computing the path of ocean wave rays according to the geometrical
@@ -40,7 +41,7 @@ class Wave_tracing():
             ny (int): number of points in y-direction of velocity domain
             nt (int): number of time steps for computation
             T (int): Seconds. Duration of wave tracing
-            dx (int): Spatial resolution in x-direction. Units conforming to U (is this an array?)
+            dx (int): Spatial resolution in x-direction. Units conforming to U
             dy (int): Spatial resolution in y-direction. Units conforming to V
             nb_wave_rays (int): Number of wave rays to track.
             domain_*0 (float): start value of domain area in X and Y direction
@@ -83,7 +84,7 @@ class Wave_tracing():
         else:
             d_static = 1e5
             logging.info(f'Hardcoding bathymetry to {d_static}m since not given.')
-            self.d = check_bathymetry(d=np.ones((ny,nx))*d_static,x=self.x,y=self.y)
+            self.d = check_bathymetry(d=np.ones((ny,nx))*d_static, x=self.x, y=self.y, is_spherical=self.is_spherical)
 
         #-----------print("self.d: ", self.d)
 
@@ -91,9 +92,9 @@ class Wave_tracing():
         self.dddx = self.d.differentiate(coord='x',edge_order=2)
         self.dddy = self.d.differentiate(coord='y',edge_order=2)
 
-        if self.is_spherical:
+        """if self.is_spherical:
             self.dddx = self.dddx*np.pi/180
-            self.dddy = self.dddy*np.pi/180
+            self.dddy = self.dddy*np.pi/180"""
 
         # Setting up the wave rays
         self.ray_x = np.zeros((nb_wave_rays,nt))
@@ -200,9 +201,11 @@ class Wave_tracing():
         dw_criteria = k*d>25
 
         if dw_criteria.all():
+#            print("deep-water approximation applied")
             c_in = np.sqrt(g/k)
             n=0.5
         else:
+#            print("shallow-water approximation")
             c_in = np.sqrt((g/k)*np.tanh(k*d)) #intrinsic
             n = 0.5 * (1 + (2*k*d)/np.sinh(2*k*d))
 
@@ -228,7 +231,7 @@ class Wave_tracing():
         return sigma
   
     # Need not change
-    def dsigma_x(self,k,idxs,idys,ray_depths):
+    def dsigma_x(self,k,idxs,idys,ray_depths):#,is_spherical=False):
         """ Compute the gradient of sigma in the x-direction due to
         the bathymetry.
         """
@@ -258,7 +261,7 @@ class Wave_tracing():
         """
         kd = k*ray_depths
         nabla_d_rays = self.dddx.values[idys,idxs]
-        nabla_c = 0.5*np.sqrt((self.g*k) / np.tanh(kd)) * (1-(np.tanh(kd))**2) *nabla_d_rays
+        nabla_c = 0.5*np.sqrt((self.g*k) / np.tanh(kd)) * (1-(np.tanh(kd)**2)) *nabla_d_rays
         return nabla_c
         
 
@@ -267,7 +270,7 @@ class Wave_tracing():
         """
         kd = k*ray_depths
         nabla_d_rays = self.dddy.values[idys,idxs]
-        nabla_c = 0.5*np.sqrt((self.g*k) / np.tanh(kd)) * (1-(np.tanh(kd))**2) *nabla_d_rays
+        nabla_c = 0.5*np.sqrt((self.g*k) / np.tanh(kd)) * (1-(np.tanh(kd)**2)) *nabla_d_rays
         return nabla_c
 
 
@@ -275,7 +278,7 @@ class Wave_tracing():
     # ------------------------------------------CHANGE; SEE K_IMP ESPECIALLY-----------------------------------------
     # ---------------------------------------------------------------------------------------------------------------  
 
-    def wave(self,T,theta,d,U=0,V=0):
+    def wave(self,T,theta,d,U=0,V=0, **kwargs):
         """ Method computing wave number from initial wave period.
         Solving implicitly for the wave number k, with initial guess from the approximate
         wave number according to Eckart (1952)
@@ -309,17 +312,36 @@ class Wave_tracing():
 
         from scipy.optimize import fsolve
 
-        def k_imp(kk, d=d, g=g,T=T,U=U,V=V):
-            kx_ap = kk*np.cos(theta)
-            ky_ap = kk*np.sin(theta)
-            return (np.sqrt((g*kk * np.tanh(kk*d)))+ kx_ap*U + ky_ap*V ) - (2*np.pi)/T 
-        
-        #----------print("k_approx: ",k_approx)
-        k = fsolve(k_imp,k_approx)
-        k = k.squeeze()
+        #--------------------------------
+        # REDO FOR SPHERICAL GEOMETRIES?? Yes
+        if self.is_spherical:
+            y = kwargs.get("y")
+            def k_imp(kk, d=d, g=g,T=T,U=U,V=V):
+                kx_ap = kk*np.cos(theta)*R*np.cos(y)
+                ky_ap = kk*np.sin(theta)*R
+                return (np.sqrt((g*kk * np.tanh(kk*d)))+ kx_ap*U + ky_ap*V ) - (2*np.pi)/T 
 
-        kx = k*np.cos(theta)
-        ky = k*np.sin(theta)
+            
+            #----------print("k_approx: ",k_approx)
+            k = fsolve(k_imp,k_approx)
+            k = k.squeeze()
+
+            kx = k*np.cos(theta)*R*np.cos(y)
+            ky = k*np.sin(theta)*R
+
+        else:
+            def k_imp(kk, d=d, g=g,T=T,U=U,V=V):
+                kx_ap = kk*np.cos(theta)
+                ky_ap = kk*np.sin(theta)
+                return (np.sqrt((g*kk * np.tanh(kk*d)))+ kx_ap*U + ky_ap*V ) - (2*np.pi)/T 
+
+            
+            #----------print("k_approx: ",k_approx)
+            k = fsolve(k_imp,k_approx)
+            k = k.squeeze()
+
+            kx = k*np.cos(theta)
+            ky = k*np.sin(theta)
         #logger.info('wave: {}, {},{}, and diff {}'.format(k,kx,ky,np.abs(k_approx)))
         return k,kx,ky
 
@@ -417,27 +439,25 @@ class Wave_tracing():
 ## ISSUE TRACED HERE; d.sel not working
 
         # set inital wave properties
-        #if self.is_spherical:
-        #    for i in range(nb_wave_rays):
-        #        print("ys = ", ys[i], ", xs = ", xs[i])
-        #        self.ray_k[i,0], self.ray_kx[i,0], self.ray_ky[i,0] = self.wave(T=wave_period,
-        #                                                            theta=theta0[i],
-        #                                                            d=self.d.sel(y=ys[i],x=xs[i],method='nearest').values,
-        #                                                            U=self.U.isel(time=self.velocity_idt[i]).sel(lat=ys[i],lon=xs[i],method='nearest').values,
-        #                                                            V=self.V.isel(time=self.velocity_idt[i]).sel(lat=ys[i],lon=xs[i],method='nearest').values
-        #                                                            )
-        #        print("sel: ", self.d.sel(y=ys[i],x=xs[i],method='nearest').values)
-        #        print("ray: ", self.ray_k[i,0])
-        #        self.ray_cg[i,0] = self.c_intrinsic(k=self.ray_k[i,0],d=self.d.sel(y=ys[i],x=xs[i],method='nearest'),group_velocity=True)
-        #else:
-        for i in range(nb_wave_rays):
-            self.ray_k[i,0], self.ray_kx[i,0], self.ray_ky[i,0] = self.wave(T=wave_period,
-                                                                theta=theta0[i],
-                                                                d=self.d.sel(y=ys[i],x=xs[i],method='nearest').values,
-                                                                U=self.U.isel(time=self.velocity_idt[i]).sel(y=ys[i],x=xs[i],method='nearest').values,
-                                                                V=self.V.isel(time=self.velocity_idt[i]).sel(y=ys[i],x=xs[i],method='nearest').values
-                                                                )
-            self.ray_cg[i,0] = self.c_intrinsic(k=self.ray_k[i,0],d=self.d.sel(y=ys[i],x=xs[i],method='nearest'),group_velocity=True)
+        if self.is_spherical:
+            for i in range(nb_wave_rays):
+                        self.ray_k[i,0], self.ray_kx[i,0], self.ray_ky[i,0] = self.wave(T=wave_period,
+                                                                            theta=theta0[i],
+                                                                            d=self.d.sel(y=ys[i],x=xs[i],method='nearest').values,
+                                                                            U=self.U.isel(time=self.velocity_idt[i]).sel(y=ys[i],x=xs[i],method='nearest').values,
+                                                                            V=self.V.isel(time=self.velocity_idt[i]).sel(y=ys[i],x=xs[i],method='nearest').values,
+                                                                            y=ys[i])
+                        self.ray_cg[i,0] = self.c_intrinsic(k=self.ray_k[i,0],d=self.d.sel(y=ys[i],x=xs[i],method='nearest'),group_velocity=True)
+        else:
+            for i in range(nb_wave_rays):
+                self.ray_k[i,0], self.ray_kx[i,0], self.ray_ky[i,0] = self.wave(T=wave_period,
+                                                                    theta=theta0[i],
+                                                                    d=self.d.sel(y=ys[i],x=xs[i],method='nearest').values,
+                                                                    U=self.U.isel(time=self.velocity_idt[i]).sel(y=ys[i],x=xs[i],method='nearest').values,
+                                                                    V=self.V.isel(time=self.velocity_idt[i]).sel(y=ys[i],x=xs[i],method='nearest').values
+                                                                    )
+                self.ray_cg[i,0] = self.c_intrinsic(k=self.ray_k[i,0],d=self.d.sel(y=ys[i],x=xs[i],method='nearest'),group_velocity=True)
+            print(self.ray_k[i,0], self.ray_kx[i,0], self.ray_ky[i,0], self.ray_cg[i,0])
 
         # set inital wave propagation direction
         self.ray_theta[:,0] = theta0
@@ -503,6 +523,7 @@ class Wave_tracing():
             self.ray_dvdx[:,n] = dvdx.values[velocity_idt[n], idys, idxs]
             #logger.info() # CHECK FOR BOTH U AND V
             
+            ## CHECK IF USES SPHERICAL
             self.d_cx[:,n] = self.grad_c_x(ray_k[:,n], idxs, idys, ray_depth)
             self.d_cy[:,n] = self.grad_c_y(ray_k[:,n], idxs, idys, ray_depth)
 
@@ -530,8 +551,8 @@ class Wave_tracing():
 
 
             # EVOLUTION IN WAVE NUMBER
-            self.dsigma_dx[:,n] = self.dsigma_x(ray_k[:,n], idxs, idys,ray_depth)
-            self.dsigma_dy[:,n] = self.dsigma_y(ray_k[:,n], idxs, idys,ray_depth)
+            self.dsigma_dx[:,n] = self.dsigma_x(ray_k[:,n], idxs, idys, ray_depth)
+            self.dsigma_dy[:,n] = self.dsigma_y(ray_k[:,n], idxs, idys, ray_depth)
 
             if self.is_spherical:
                 f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dx[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
@@ -552,6 +573,15 @@ class Wave_tracing():
             else:
                 f_wave_nb = WaveNumberEvolution(d_sigma=self.dsigma_dy[:,n], kx=ray_kx[:,n], ky=ray_ky[:,n],
                                                 dUkx=self.ray_dudy[:,n], dUky=self.ray_dvdy[:,n])
+
+        # For testing purposes to find out if the issue happens before or after the solver runs
+#            if n==0:
+ #               print("first iteration: d_sigma:", self.dsigma_dy[:,n], "ray_kx:", ray_kx[:,n], "ray_ky:", ray_ky[:,n], "ray_dudy:", self.ray_dudy[:,n], 
+  #                    "ray_dvdy:", self.ray_dvdy[:,n], "ray_cg:", ray_cg[:,n], "ray_y:", ray_y[:,n], "ray_k:", ray_k[:,n], "U:", U[velocity_idt[n],idys,idxs], "ray_theta:", ray_theta[:,n])
+   #         elif n==1:
+    #            print("second iteration: d_sigma:", self.dsigma_dy[:,n], "ray_kx:", ray_kx[:,n], "ray_ky:", ray_ky[:,n], "ray_dudy:", self.ray_dudy[:,n], 
+     #                 "ray_dvdy:", self.ray_dvdy[:,n], "ray_cg:", ray_cg[:,n], "ray_y:", ray_y[:,n], "ray_k:", ray_k[:,n], "U:", U[velocity_idt[n],idys,idxs], "ray_theta:", ray_theta[:,n])
+      #          raise RuntimeError("Intentional crash")
             
             ray_ky[:,n+1] = solver.advance(u=ray_ky[:,n], f=f_wave_nb, k=n, t=t)# NOTE: this "k" is a counter and not wave number
 
@@ -559,7 +589,7 @@ class Wave_tracing():
             if self.is_spherical:
                 ray_k[:,n+1] = np.sqrt((ray_kx[:,n+1]/np.cos(ray_y[:,n+1]))**2 
                                        +ray_ky[:,n+1]**2)/R
-                ray_theta[:,n+1] = np.arctan2(ray_ky[:,n+1],ray_kx[:,n+1]/np.cos(ray_y[:,n+1]))
+                ray_theta[:,n+1] = np.arctan2(ray_ky[:,n+1], ray_kx[:,n+1]/np.cos(ray_y[:,n+1]))
             else:
                 ray_k[:,n+1] = np.sqrt(ray_kx[:,n+1]**2+ray_ky[:,n+1]**2)
                 ray_theta[:,n+1] = np.arctan2(ray_ky[:,n+1],ray_kx[:,n+1])
@@ -598,7 +628,7 @@ class Wave_tracing():
         self.d_cx[:,n+1] = self.grad_c_x(ray_k[:,n+1], idxs, idys, self.ray_depth[:,n+1])
         self.d_cy[:,n+1] = self.grad_c_y(ray_k[:,n+1], idxs, idys, self.ray_depth[:,n+1])
 
-        ray_cg[:,n+1] = self.c_intrinsic(ray_k[:,n],d=self.ray_depth[:,n+1],group_velocity=True)
+        ray_cg[:,n+1] = self.c_intrinsic(ray_k[:,n+1],d=self.ray_depth[:,n+1],group_velocity=True)
 
 
         self.dudy = dudy
@@ -612,7 +642,7 @@ class Wave_tracing():
         self.ray_y= ray_y
         self.ray_theta = ray_theta
         self.ray_cg = ray_cg
-        logging.info('Stoppet at time idt: {}'.format(velocity_idt[n]))
+        logging.info('Stopped at time idt: {}'.format(velocity_idt[n]))
 
     # ---------------------------------------------------------------------------------------------------------------
     # ---------------------------------------------TO_LATLON UNNESCESSARY--------------------------------------------
