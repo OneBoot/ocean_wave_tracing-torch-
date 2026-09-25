@@ -549,6 +549,8 @@ class Wave_tracing():
                 f_adv = Advection(cg=ray_cg[:,n], k=ray_k[:,n], kx=ray_ky[:,n], U=V[velocity_idt[n],idys,idxs])
             ray_y[:,n+1] = solver.advance(u=ray_y[:,n], f=f_adv, k=n, t=t)# NOTE: this k is a counter and not wave number
 
+            if self.is_spherical:
+                ray_x[:,n+1] = ray_x[:,n+1] % (2*np.pi)
 
             # EVOLUTION IN WAVE NUMBER
             self.dsigma_dx[:,n] = self.dsigma_x(ray_k[:,n], idxs, idys, ray_depth)
