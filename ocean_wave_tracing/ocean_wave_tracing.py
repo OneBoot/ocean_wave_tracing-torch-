@@ -13,7 +13,7 @@ from importlib_resources import files, as_file
 from .util_solvers import Advection, WaveNumberEvolution, RungeKutta4
 from .util_methods import make_xarray_dataArray, to_xarray_ds, check_velocity_field, check_bathymetry
 
-from .util_metric import find_g_im_h, find_gnj, find_J_jm
+from .util_metric import CartesianMetric
 import torch
 
 
@@ -30,7 +30,7 @@ class Wave_tracing():
     """
     def __init__(self, U, V,  nx, ny, nt, T, dx, dy,
                  nb_wave_rays, domain_X0, domain_XN, domain_Y0, domain_YN,
-                 temporal_evolution=False,
+                 temporal_evolution=False, metric=CartesianMetric,
                  d=None,DEBUG=False,**kwargs):
         """
         Args:
@@ -50,10 +50,11 @@ class Wave_tracing():
             **kwargs
         """
 
-        #print(torch.__version__)
         #Should be changeable later
         self.device = "cpu"
+
         self.d_type = torch.float32
+        self.metric = CartesianMetric()
 
         self.g = 9.81
         self.ray_x = np.zeros((nb_wave_rays,nt))
@@ -93,17 +94,40 @@ class Wave_tracing():
         self.U = check_velocity_field(U,temporal_evolution,x=self.x,y=self.y)
         self.V = check_velocity_field(V,temporal_evolution,x=self.x,y=self.y)
 
+        # Spatial gradients for every time snapshot
+        dU_dy, dU_dx = torch.gradient(torch.from_numpy(self.U.values), spacing=(self.dy, self.dx), dim=(-2, -1))
+        dV_dy, dV_dx = torch.gradient(torch.from_numpy(self.V.values), spacing=(self.dy, self.dx), dim=(-2, -1))
+
         self.field = torch.from_numpy(
             np.stack([
-                self.d.values,
-                self.U.values[0],
-                self.V.values[0],
-            ])
-        ).float().unsqueeze(0)
-
-        print(np.isnan(self.U.values).any())
+                np.broadcast_to(self.d.values, self.U.values.shape),
+                self.U.values,
+                self.V.values,
+                dU_dx,
+                dU_dy,
+                dV_dx,
+                dV_dy
+            ], axis=1)
+        ).float()
 
         self.rays = torch.tensor([0.,0.,0.,0.], requires_grad=True).repeat(nt, nb_wave_rays, 1)
+
+        self.ray_k = torch.tensor(0.).repeat(nt, nb_wave_rays)
+        self.ray_kx = torch.tensor(0.).repeat(nt, nb_wave_rays)
+        self.ray_ky = torch.tensor(0.).repeat(nt, nb_wave_rays)
+
+        self.ray_cg = torch.tensor(0.).repeat(nt, nb_wave_rays)
+        self.ray_theta = torch.tensor(0.).repeat(nt, nb_wave_rays)
+
+        self.ray_depth = torch.tensor(0.).repeat(nt, nb_wave_rays)
+        self.ray_U = torch.tensor(0.).repeat(nt, nb_wave_rays)
+        self.ray_V = torch.tensor(0.).repeat(nt, nb_wave_rays)
+
+        self.ray_dudx = torch.tensor(0.).repeat(nt, nb_wave_rays)
+        self.ray_dvdy = torch.tensor(0.).repeat(nt, nb_wave_rays)
+        self.ray_dudy = torch.tensor(0.).repeat(nt, nb_wave_rays)
+        self.ray_dvdx = torch.tensor(0.).repeat(nt, nb_wave_rays)
+
 
         # Time
         self.dt = T/nt
@@ -263,20 +287,20 @@ class Wave_tracing():
                 i_w_side = 'left'
 
             if i_w_side == 'left':
-                xs = np.ones(nb_wave_rays)*self.domain_X0
-                ys = np.linspace(self.domain_Y0, self.domain_YN, nb_wave_rays)
+                xs = torch.ones(nb_wave_rays)*self.domain_X0
+                ys = torch.linspace(self.domain_Y0, self.domain_YN, nb_wave_rays)
 
             elif i_w_side == 'right':
-                xs = np.ones(nb_wave_rays)*self.domain_XN
-                ys = np.linspace(self.domain_Y0, self.domain_YN, nb_wave_rays)
+                xs = torch.ones(nb_wave_rays)*self.domain_XN
+                ys = torch.linspace(self.domain_Y0, self.domain_YN, nb_wave_rays)
 
             elif i_w_side == 'top':
-                xs = np.linspace(self.domain_X0, self.domain_XN, nb_wave_rays)
-                ys = np.ones(nb_wave_rays)*self.domain_YN
+                xs = torch.linspace(self.domain_X0, self.domain_XN, nb_wave_rays)
+                ys = torch.ones(nb_wave_rays)*self.domain_YN
 
             elif i_w_side == 'bottom':
-                xs = np.linspace(self.domain_X0, self.domain_XN, nb_wave_rays)
-                ys = np.ones(nb_wave_rays)*self.domain_Y0
+                xs = torch.linspace(self.domain_X0, self.domain_XN, nb_wave_rays)
+                ys = torch.ones(nb_wave_rays)*self.domain_Y0
 
         else:
             logger.info('No initial side given. Try with discrete points')
@@ -342,66 +366,68 @@ class Wave_tracing():
     def find_k(self, Theta, g_metric):
         # Theta: (N, 2)
         # g_metric: (2, 2)
-
         return torch.einsum("ni,ij->nj", Theta, g_metric)
 
-    def find_sigma(self, k, d):
-        # k: (N, 2)
-        # d: (N,)
-        k_norm = torch.linalg.vector_norm(k, dim=1)
-
+    def find_sigma(self, k_norm, d):
         return torch.sqrt(G * k_norm * torch.tanh(k_norm * d))
 
-    def find_U_and_d(self, positions):
+    def find_U_and_d(self, positions, idt):
         # positions: (N, 2)
 
-        x = (2*(positions[:, 0] - self.domain_X0) / (self.domain_XN-self.domain_X0)-1)
+        x = (2*(positions[:, 0]-self.domain_X0) / (self.domain_XN-self.domain_X0)-1)
         y = (2*(positions[:, 1]-self.domain_Y0) / (self.domain_YN-self.domain_Y0)-1)
 
         # We need to reshape the array, since the interpolation step is batched
         # (N, 2) -> (1, N, 1, 2) 
         grid = torch.stack([x, y], dim=-1).reshape(1, -1, 1, 2)
 
-        interpolated = torch.nn.functional.grid_sample(self.field, grid, mode="bilinear", align_corners=True)
+        interpolated = torch.nn.functional.grid_sample(self.field[idt].unsqueeze(0), grid, 
+                                                       mode="bilinear", align_corners=True)
 
         # We need to reshape the array back, removing redndant layers
         # (1, 3, N, 1) -> (N, 3)
         interpolated = interpolated[0, :, :, 0].T
 
         local_d = interpolated[:, 0]
-        local_U = interpolated[:, 1:]
+        local_U = interpolated[:, 1:3]
+        local_dU = interpolated[:,2:]
 
-        return local_d, local_U
+        return local_d, local_U, local_dU
 
-    def Omega(self, rays):
+    def Omega(self, rays, idt):
         # rays: (N, 4)
         #       x, y, kx, ky
 
         positions = rays[:, :2]
         Theta = rays[:, 2:]
 
-        d, U = self.find_U_and_d(positions)
+        d, U, dU = self.find_U_and_d(positions, idt)
 
-        g_im_h = find_g_im_h(positions[0])
-        g_nj = find_gnj(positions[0])
-        J_jm = find_J_jm(positions[0])
+        # In the future, these could be aggregated within the metric class to avoid multiplying over inverses every time
+        g_im_h = self.metric.find_g_im_h(positions[0])
+        g_nj = self.metric.find_gnj(positions[0])
+        J_jm = self.metric.find_J_jm(positions[0])
 
         k = self.find_k(Theta, g_nj)
+        k_norm = torch.linalg.vector_norm(k, dim=1)
 
-        sigma = self.find_sigma(k, d)
+        sigma = self.find_sigma(k_norm, d)
 
         current_term = torch.einsum("im,mj,ni,nj->n", g_im_h, J_jm, U, k)
 
-        return sigma + current_term
+        return sigma + current_term, k, k_norm, d, U, dU
 
-    def dOmega(self, rays):
+    def dOmega(self, rays, idt):
         rays = rays.clone().detach().requires_grad_(True)
 
-        omega = self.Omega(rays)
+        omega, k, k_norm, d, U, dU = self.Omega(rays, idt)
+
+        sigma = self.find_sigma(k_norm, d)
 
         dOmega = torch.autograd.grad(omega.sum(), rays, create_graph=False, allow_unused=False)[0]
+        cg = torch.autograd.grad(sigma.sum(), k_norm, create_graph=False, allow_unused=False)[0]
 
-        return dOmega
+        return dOmega, k, k_norm, cg, d, U,  dU
     
     def solve(self, solver=RungeKutta4):
         """ Solve the geometrical optics equations numerically by means of the
@@ -423,18 +449,38 @@ class Wave_tracing():
             #======================================================
             ### numerical integration of the wave ray equations ###
             #======================================================
+
+            idt = self.velocity_idt[n]
             
             # Noticed that the original did not make use of the Runge-Kutta functionality, so I skip this here
-            dOmega = self.dOmega(self.rays[n, :])
+            dOmega, k, k_norm, cg, d, U, dU = self.dOmega(self.rays[n, :], idt)
 
             dOmega = (dOmega[..., [2, 3, 0, 1]] * torch.tensor([1., 1., -1., -1.]))
             self.rays[n+1,:] = self.rays[n,:] + dt*dOmega
+
+            # Store ray parameters ouptut from the solver
+          #  self.ray_x[:,:] = self.rays[:, :, 0]#.detach().numpy().T
+          #  self.ray_y[:,:] = self.rays[:, :, 1]#.detach().numpy().T
+            self.ray_k[n+1,:] = k_norm
+            self.ray_kx[n+1,:] = k[:,0]
+            self.ray_ky[n+1,:] = k[:,1]
+
+            self.ray_theta[n+1, :] = torch.atan2(self.ray_ky[n+1,:], self.ray_kx[n+1,:])
+            self.ray_cg[n+1, :] = cg
+
+            self.ray_depth[n+1,:] = d
+            self.ray_U[n+1, :] = U[:,0]
+            self.ray_V[n+1, :] = U[:,1]
+
+            self.ray_dudx[n+1, :] = dU[:,0]
+            self.ray_dvdy[n+1, :] = dU[:,1]
+            self.ray_dudy[n+1, :] = dU[:,2]
+            self.ray_dvdx[n+1, :] = dU[:,3]
 
         logging.info('Stoppet at time idt: {}'.format(velocity_idt[n]))
         self.ray_x[:,:] = self.rays[:, :, 0].detach().numpy().T
         self.ray_y[:,:] = self.rays[:, :, 1].detach().numpy().T
 
-        print(self.ray_x.shape)
 
     def to_ds(self,**kwargs):
         """Convert wave ray information to xarray object"""
@@ -445,23 +491,29 @@ class Wave_tracing():
             lons = np.zeros((self.nb_wave_rays,self.nt))
             lats = lons.copy()
 
-        variables = {'ray_k':self.ray_k,
-                    'ray_kx':self.ray_kx,
-                    'ray_ky':self.ray_ky,
+        variables = {'ray_k':self.ray_k.detach().numpy().T,
+                    'ray_kx':self.ray_kx.detach().numpy().T,
+                    'ray_ky':self.ray_ky.detach().numpy().T,
                     'ray_x':self.ray_x,
                     'ray_y':self.ray_y,
-                    'ray_U':self.ray_U,
-                    'ray_V':self.ray_V,
-                    'ray_theta':self.ray_theta,
-                    'ray_cg':self.ray_cg,
-                    'ray_depth':self.ray_depth,
+
+                    'ray_U':self.ray_U.detach().numpy().T,
+                    'ray_V':self.ray_V.detach().numpy().T,
+
+                    'ray_theta':self.ray_theta.detach().numpy().T,
+                    'ray_cg':self.ray_cg.detach().numpy().T,
+
+                    'ray_depth':self.ray_depth.detach().numpy().T,
+
                     'ray_lat': lats,
-                    'ray_lon':lons,
-                    'ray_dudx':self.ray_dudx,
-                    'ray_dvdy':self.ray_dvdy,
-                    'ray_dudy':self.ray_dudy,
-                    'ray_dvdx':self.ray_dvdx
+                    'ray_lon': lons,
+
+                    'ray_dudx':self.ray_dudx.detach().numpy().T,
+                    'ray_dvdy':self.ray_dvdy.detach().numpy().T,
+                    'ray_dudy':self.ray_dudy.detach().numpy().T,
+                    'ray_dvdx':self.ray_dvdx.detach().numpy().T,
                     }
+
 
         source = files('ocean_wave_tracing').joinpath('ray_metadata.json')
         with as_file(source) as sfile:
@@ -531,7 +583,7 @@ class Wave_tracing():
         """
         lats = np.zeros((self.nb_wave_rays,self.nt))
         lons = np.zeros((self.nb_wave_rays,self.nt))
-        ##print(pyproj.__dict__.keys())
+
         for i in range(self.nb_wave_rays):
             lons[i,:],lats[i,:] = pyproj.Transformer.from_proj(proj4,'epsg:4326', always_xy=True).transform(self.ray_x[i,:], self.ray_y[i,:])
 
