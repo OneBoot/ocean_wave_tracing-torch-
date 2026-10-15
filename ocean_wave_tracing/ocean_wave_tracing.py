@@ -21,9 +21,6 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(filename='ocean_wave_tracing.log', level=logging.INFO)
 logging.info('\nStarted')
 
-#gravitational constant
-G=9.81
-
 class Wave_tracing():
     """ Class computing the path of ocean wave rays according to the geometrical
     optics approximation.
@@ -57,8 +54,6 @@ class Wave_tracing():
         self.metric = CartesianMetric()
 
         self.g = 9.81
-        self.ray_x = np.zeros((nb_wave_rays,nt))
-        self.ray_y = np.zeros((nb_wave_rays,nt))
         self.nx = nx
         self.ny = ny
         self.nt = nt
@@ -68,6 +63,8 @@ class Wave_tracing():
         self.C = -1
         assert nb_wave_rays > 0, "Number of wave rays must be larger than zero"
 
+        #Indexer, keeping track of the ray ids at a given timestep
+        self.active_ray_indices = [torch.as_tensor(np.arange(0, self.nb_wave_rays))]
 
         self.domain_X0 = torch.as_tensor(domain_X0, dtype=self.d_type, device=self.device) # left side
         self.domain_XN = torch.as_tensor(domain_XN, dtype=self.d_type, device=self.device) # right side
@@ -111,23 +108,6 @@ class Wave_tracing():
         ).float()
 
         self.rays = torch.tensor([0.,0.,0.,0.], requires_grad=True).repeat(nt, nb_wave_rays, 1)
-
-        self.ray_k = torch.tensor(0.).repeat(nt, nb_wave_rays)
-        self.ray_kx = torch.tensor(0.).repeat(nt, nb_wave_rays)
-        self.ray_ky = torch.tensor(0.).repeat(nt, nb_wave_rays)
-
-        self.ray_cg = torch.tensor(0.).repeat(nt, nb_wave_rays)
-        self.ray_theta = torch.tensor(0.).repeat(nt, nb_wave_rays)
-
-        self.ray_depth = torch.tensor(0.).repeat(nt, nb_wave_rays)
-        self.ray_U = torch.tensor(0.).repeat(nt, nb_wave_rays)
-        self.ray_V = torch.tensor(0.).repeat(nt, nb_wave_rays)
-
-        self.ray_dudx = torch.tensor(0.).repeat(nt, nb_wave_rays)
-        self.ray_dvdy = torch.tensor(0.).repeat(nt, nb_wave_rays)
-        self.ray_dudy = torch.tensor(0.).repeat(nt, nb_wave_rays)
-        self.ray_dvdx = torch.tensor(0.).repeat(nt, nb_wave_rays)
-
 
         # Time
         self.dt = T/nt
@@ -363,13 +343,23 @@ class Wave_tracing():
     # PYTORCH FUNCTIONALITY HERE (WITHOUT DELETING)
     #------------------------------------------------------------------------------------------------------------------------------------------------–
 
+    class ray_properties():
+        # Helper class that keeps all interesting ray properties needed for generating the end dataset in one place
+        def __init__(self, k, k_norm, d, U, dU, cg=None):
+            self.k = k
+            self.k_norm = k_norm
+            self.d = d
+            self.U = U
+            self.dU = dU
+            self.cg = cg
+    
     def find_k(self, Theta, g_metric):
         # Theta: (N, 2)
         # g_metric: (2, 2)
         return torch.einsum("ni,ij->nj", Theta, g_metric)
 
     def find_sigma(self, k_norm, d):
-        return torch.sqrt(G * k_norm * torch.tanh(k_norm * d))
+        return torch.sqrt(self.g * k_norm * torch.tanh(k_norm * d))
 
     def find_U_and_d(self, positions, idt):
         # positions: (N, 2)
@@ -384,13 +374,13 @@ class Wave_tracing():
         interpolated = torch.nn.functional.grid_sample(self.field[idt].unsqueeze(0), grid, 
                                                        mode="bilinear", align_corners=True)
 
-        # We need to reshape the array back, removing redndant layers
+        # We need to reshape the array back, removing redundant layers
         # (1, 3, N, 1) -> (N, 3)
         interpolated = interpolated[0, :, :, 0].T
 
         local_d = interpolated[:, 0]
         local_U = interpolated[:, 1:3]
-        local_dU = interpolated[:,2:]
+        local_dU = interpolated[:, 3:7]
 
         return local_d, local_U, local_dU
 
@@ -415,119 +405,227 @@ class Wave_tracing():
 
         current_term = torch.einsum("im,mj,ni,nj->n", g_im_h, J_jm, U, k)
 
-        return sigma + current_term, k, k_norm, d, U, dU
+        # Neatly pack away all the additional properties in a new data structure
+        properties = self.ray_properties(k, k_norm, d, U, dU)
+
+        return sigma + current_term, properties
 
     def dOmega(self, rays, idt):
         rays = rays.clone().detach().requires_grad_(True)
 
-        omega, k, k_norm, d, U, dU = self.Omega(rays, idt)
+        omega, properties = self.Omega(rays, idt)
 
-        sigma = self.find_sigma(k_norm, d)
+        sigma = self.find_sigma(properties.k_norm, properties.d)
 
         dOmega = torch.autograd.grad(omega.sum(), rays, create_graph=False, allow_unused=False)[0]
-        cg = torch.autograd.grad(sigma.sum(), k_norm, create_graph=False, allow_unused=False)[0]
+        properties.cg = torch.autograd.grad(sigma.sum(), properties.k_norm, create_graph=False, allow_unused=False)[0]
 
-        return dOmega, k, k_norm, cg, d, U,  dU
+        return dOmega, properties
+
     
-    def solve(self, solver=RungeKutta4):
-        """ Solve the geometrical optics equations numerically by means of the
-            method of characteristics
+    def initialize_ray_history(self):
+        """Allocate histories indexed by timestep and stable ray ID."""
+        nt = self.nt
+        nr = self.nb_wave_rays
+
+        names = ["ray_x", "ray_y",
+                 "ray_k", "ray_kx", "ray_ky",
+                 "ray_U", "ray_V",
+                 "ray_theta", "ray_cg", "ray_depth",
+                 "ray_dudx", "ray_dvdy", "ray_dudy", "ray_dvdx"]
+
+        self.property_history = self.property_history = {name: torch.full((nt, nr), float("nan"), 
+                                                                          dtype=torch.float32, device=self.device) 
+                                                                          for name in names}
+
+        # Preserve the initial states in the original tensor format.
+        self.rays_history = torch.full((nt, nr, 4), float("nan"), dtype=self.rays.dtype, device=self.rays.device)
+
+        self.rays_history[0] = self.rays[0].detach()
+
+        # Keep the original public attributes available as lists.
+        for name in names:
+            setattr(self, name, [])
+
+
+    def store_ray_properties(self, timestep, ray_ids, rays, properties):
+        """
+        Store properties by stable ray ID.
+
+        rays:      (N, 4), ordered as x, y, kx, ky
+        ray_ids:   (N,), original ray IDs
+        properties: properties evaluated at these same ray states
         """
 
-        if not callable(solver):
-            raise TypeError('f is %s, not a solver' % type(solver))
-        
+        # All properties must correspond to the same active rays.
+        values = {
+            "ray_x": rays[:, 0],
+            "ray_y": rays[:, 1],
+            "ray_k": properties.k_norm,
+            "ray_kx": properties.k[:, 0],
+            "ray_ky": properties.k[:, 1],
+            "ray_U": properties.U[:, 0],
+            "ray_V": properties.U[:, 1],
+            "ray_cg": properties.cg,
+            "ray_depth": properties.d,
+            "ray_dudx": properties.dU[:, 0],
+            "ray_dudy": properties.dU[:, 1],
+            "ray_dvdx": properties.dU[:, 2],
+            "ray_dvdy": properties.dU[:, 3],
+        }
+
+        # Convert stable ray IDs to a tensor.
+        ray_ids_t = ray_ids.to(device=self.device, dtype=torch.long)
+
+        # Validate every field before writing.
+        n_active = len(ray_ids_t)
+
+        for name, value in values.items():
+            if value.ndim != 1 or len(value) != n_active:
+                raise ValueError(f"{name}: expected {n_active} values, got shape {tuple(value.shape)}")
+
+        # Store each property in its original ray-ID column.
+        for name, value in values.items():
+            self.property_history[name][timestep, ray_ids_t] = (value.detach().to(device=self.device, dtype=torch.float32))
+
+        # Derive the direction from the stored wavenumber components.
+        kx = self.property_history["ray_kx"][timestep, ray_ids_t]
+        ky = self.property_history["ray_ky"][timestep, ray_ids_t]
+
+        self.property_history["ray_theta"][timestep, ray_ids_t] = (torch.atan2(ky, kx))
+
+
+    def solve(self, solver=None):
+        """
+        Trace rays and store all properties at their corresponding
+        timestep and original ray ID.
+
+        State vector: [x, y, kx, ky]
+        """
+        self.initialize_ray_history()
+
+        nr = self.nb_wave_rays
         nt = self.nt
-        velocity_idt = self.velocity_idt
+        dt = self.T / nt
 
-        counter=0
-        t = np.linspace(0,self.T,nt)
-        dt = self.T/nt
+        active_ids = torch.arange(nr, dtype=torch.long)
+        active_rays = self.rays[0].detach().clone()
 
-        for n in range(0,nt-1):
+        # Preserve these lists for compatibility with existing code.
+        self.active_ray_indices = [active_ids.clone()]
+        self.active_rays = [active_rays.clone()]
 
-            #======================================================
-            ### numerical integration of the wave ray equations ###
-            #======================================================
+        for n in range(nt):
+            #check if any rays still exist at all
+            if len(active_ids) == 0:
+                break
 
-            idt = self.velocity_idt[n]
-            
-            # Noticed that the original did not make use of the Runge-Kutta functionality, so I skip this here
-            dOmega, k, k_norm, cg, d, U, dU = self.dOmega(self.rays[n, :], idt)
+            # identify the relevant time index, if time exceeds defined current field time domain,
+            #  revert to last current field snapshot
+            idt = int(self.velocity_idt[min(n, len(self.velocity_idt) - 1)])
 
-            dOmega = (dOmega[..., [2, 3, 0, 1]] * torch.tensor([1., 1., -1., -1.]))
-            self.rays[n+1,:] = self.rays[n,:] + dt*dOmega
+            # Evaluate the current state and its properties together.
+            dOmega, properties = self.dOmega(active_rays, idt)
 
-            # Store ray parameters ouptut from the solver
-          #  self.ray_x[:,:] = self.rays[:, :, 0]#.detach().numpy().T
-          #  self.ray_y[:,:] = self.rays[:, :, 1]#.detach().numpy().T
-            self.ray_k[n+1,:] = k_norm
-            self.ray_kx[n+1,:] = k[:,0]
-            self.ray_ky[n+1,:] = k[:,1]
+            # Verify that properties match the active rays.
+            count = len(active_ids)
+            for name in ("k", "k_norm", "d", "U", "dU", "cg"):
+                value = getattr(properties, name)
+                if value is None or value.shape[0] != count:
+                    raise ValueError(f"Timestep {n}: {name} has shape {None if value is None else tuple(value.shape)}, but there are {count} active rays.")
 
-            self.ray_theta[n+1, :] = torch.atan2(self.ray_ky[n+1,:], self.ray_kx[n+1,:])
-            self.ray_cg[n+1, :] = cg
+            # Store properties at the time they were evaluated.
+            self.store_ray_properties(timestep=n, ray_ids=active_ids, rays=active_rays, properties=properties)
 
-            self.ray_depth[n+1,:] = d
-            self.ray_U[n+1, :] = U[:,0]
-            self.ray_V[n+1, :] = U[:,1]
+            if n == nt - 1:
+                break
 
-            self.ray_dudx[n+1, :] = dU[:,0]
-            self.ray_dvdy[n+1, :] = dU[:,1]
-            self.ray_dudy[n+1, :] = dU[:,2]
-            self.ray_dvdx[n+1, :] = dU[:,3]
+            # dOmega is ordered [dkx, dky, dx, dy].
+            derivative = dOmega[:, [2, 3, 0, 1]]
+            derivative = derivative * torch.tensor([1., 1., -1., -1.], dtype=active_rays.dtype, device=active_rays.device)
 
-        logging.info('Stoppet at time idt: {}'.format(velocity_idt[n]))
-        self.ray_x[:,:] = self.rays[:, :, 0].detach().numpy().T
-        self.ray_y[:,:] = self.rays[:, :, 1].detach().numpy().T
+            next_rays = active_rays + dt * derivative
+
+            # Remove rays with any non-finite state component.
+            valid = torch.isfinite(next_rays).all(dim=1)
+
+            active_ids = active_ids[valid]
+            active_rays = next_rays[valid].detach()
+
+            # Store the new positions at the next timestep.
+            if len(active_ids) > 0:
+                self.rays_history[n + 1, active_ids] = active_rays
+
+            self.active_ray_indices.append(active_ids.clone())
+            self.active_rays.append(active_rays.clone())
+
+        # Synchronize the main state tensor with the stored trajectory.
+        self.rays = self.rays_history
+
+        # Expose histories as PyTorch tensors, ordered (ray, time).
+        for name, history in self.property_history.items():
+            setattr(self, name, history.T)
+
+        logging.info("Wave tracing completed.")
 
 
-    def to_ds(self,**kwargs):
-        """Convert wave ray information to xarray object"""
+    def to_ds(self, **kwargs):
+        """Convert wave ray information to an xarray Dataset."""
 
         if 'proj4' in kwargs:
-            lons,lats = self.to_latlon(kwargs['proj4'])
+            lons, lats = self.to_latlon(kwargs['proj4'])
         else:
-            lons = np.zeros((self.nb_wave_rays,self.nt))
-            lats = lons.copy()
+            lons = np.full((self.nb_wave_rays, self.nt), np.nan)
+            lats = np.full_like(lons, np.nan)
 
-        variables = {'ray_k':self.ray_k.detach().numpy().T,
-                    'ray_kx':self.ray_kx.detach().numpy().T,
-                    'ray_ky':self.ray_ky.detach().numpy().T,
-                    'ray_x':self.ray_x,
-                    'ray_y':self.ray_y,
+        variables = {
+            'ray_k': self.ray_k,
+            'ray_kx': self.ray_kx,
+            'ray_ky': self.ray_ky,
+            'ray_x': self.ray_x,
+            'ray_y': self.ray_y,
+            'ray_U': self.ray_U,
+            'ray_V': self.ray_V,
+            'ray_theta': self.ray_theta,
+            'ray_cg': self.ray_cg,
+            'ray_depth': self.ray_depth,
+            'ray_lat': lats,
+            'ray_lon': lons,
+            'ray_dudx': self.ray_dudx,
+            'ray_dvdy': self.ray_dvdy,
+            'ray_dudy': self.ray_dudy,
+            'ray_dvdx': self.ray_dvdx,
+        }
 
-                    'ray_U':self.ray_U.detach().numpy().T,
-                    'ray_V':self.ray_V.detach().numpy().T,
+        expected_shape = (self.nb_wave_rays, self.nt)
 
-                    'ray_theta':self.ray_theta.detach().numpy().T,
-                    'ray_cg':self.ray_cg.detach().numpy().T,
+        for name, value in variables.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            else:
+                value = np.asarray(value)
 
-                    'ray_depth':self.ray_depth.detach().numpy().T,
+            if value.shape == expected_shape:
+                pass
+            elif value.shape == expected_shape[::-1]:
+                value = value.T
+            else:
+                raise ValueError(f"{name} has shape {value.shape}; expected {expected_shape} or {expected_shape[::-1]}")
 
-                    'ray_lat': lats,
-                    'ray_lon': lons,
-
-                    'ray_dudx':self.ray_dudx.detach().numpy().T,
-                    'ray_dvdy':self.ray_dvdy.detach().numpy().T,
-                    'ray_dudy':self.ray_dudy.detach().numpy().T,
-                    'ray_dvdx':self.ray_dvdx.detach().numpy().T,
-                    }
-
+            variables[name] = value
 
         source = files('ocean_wave_tracing').joinpath('ray_metadata.json')
-        with as_file(source) as sfile:
-            logging.info('Loading JSON file')
-            data = json.loads(sfile.read_text())
-            logging.info('Finished loading JSON file')
 
-        # relative time
-        t = np.linspace(0,self.T,self.nt)
+        with as_file(source) as sfile:
+            data = json.loads(sfile.read_text())
+
+        t = np.linspace(0, self.T, self.nt)
         ray_id = np.arange(self.nb_wave_rays)
 
-        vars = [make_xarray_dataArray(var=variables[vname], t=t,rays=ray_id,name=vname,attribs=data[vname]) for vname in list(variables.keys())]
+        vars = [make_xarray_dataArray(var=variables[name], t=t, rays=ray_id, name=name, attribs=data[name]) for name in variables]
 
         return to_xarray_ds(vars)
+
 
     def ray_density(self,x_increment, y_increment, plot=False):
         """ Method computing ray density within boxes. The density of wave rays
@@ -571,23 +669,28 @@ class Wave_tracing():
 
         return xx,yy,hm
 
+
     def to_latlon(self, proj4):
-        """ Method for reprojecting wave rays to latitude/longitude values
+        """Reproject ray coordinates to longitude and latitude."""
 
-        Args:
-            proj4 (str): proj4 string
+        ray_x = np.asarray(self.ray_x).T
+        ray_y = np.asarray(self.ray_y).T
 
-        Returns:
-            lons (2d): wave rays in longitude
-            lats (2d): wave rays in latitude
-        """
-        lats = np.zeros((self.nb_wave_rays,self.nt))
-        lons = np.zeros((self.nb_wave_rays,self.nt))
+        # Current layout: (time, ray)
+        expected_shape = (self.nt, self.nb_wave_rays)
 
-        for i in range(self.nb_wave_rays):
-            lons[i,:],lats[i,:] = pyproj.Transformer.from_proj(proj4,'epsg:4326', always_xy=True).transform(self.ray_x[i,:], self.ray_y[i,:])
+        if ray_x.shape != expected_shape or ray_y.shape != expected_shape:
+            raise ValueError(f"Expected coordinates with shape {expected_shape}; got ray_x={ray_x.shape}, ray_y={ray_y.shape}")
 
-        return lons, lats
+        transformer = pyproj.Transformer.from_crs(proj4, "EPSG:4326", always_xy=True)
+
+        # Transform all rays and timesteps together.
+        lons, lats = transformer.transform(ray_x, ray_y)
+
+        # Return (ray, time), matching the original method's output.
+        return np.asarray(lons).T, np.asarray(lats).T
+
+
     
     def get_ray_curvature(self,decomposed=False):
         """ Compute the approximate analytical ray curvature after Halsne and Li (2025, in rev.)
