@@ -14,6 +14,7 @@ from .util_solvers import Advection, WaveNumberEvolution, RungeKutta4
 from .util_methods import make_xarray_dataArray, to_xarray_ds, check_velocity_field, check_bathymetry
 
 from .util_metric import CartesianMetric
+from .util_derivatives import Autoderivative
 import torch
 
 
@@ -27,7 +28,7 @@ class Wave_tracing():
     """
     def __init__(self, U, V,  nx, ny, nt, T, dx, dy,
                  nb_wave_rays, domain_X0, domain_XN, domain_Y0, domain_YN,
-                 temporal_evolution=False, metric=CartesianMetric,
+                 temporal_evolution=False, metric=CartesianMetric(),
                  d=None,DEBUG=False,**kwargs):
         """
         Args:
@@ -48,10 +49,10 @@ class Wave_tracing():
         """
 
         #Should be changeable later
-        self.device = "cpu"
+        self.device = torch.device("cpu")#
+        self.dtype = torch.float32
 
-        self.d_type = torch.float32
-        self.metric = CartesianMetric()
+        self.metric = metric
 
         self.g = 9.81
         self.nx = nx
@@ -64,14 +65,16 @@ class Wave_tracing():
         assert nb_wave_rays > 0, "Number of wave rays must be larger than zero"
 
         #Indexer, keeping track of the ray ids at a given timestep
-        self.active_ray_indices = [torch.as_tensor(np.arange(0, self.nb_wave_rays))]
+        self.active_ray_indices = [torch.arange(self.nb_wave_rays, device=self.device, dtype=torch.long)]
 
-        self.domain_X0 = torch.as_tensor(domain_X0, dtype=self.d_type, device=self.device) # left side
-        self.domain_XN = torch.as_tensor(domain_XN, dtype=self.d_type, device=self.device) # right side
-        self.domain_Y0 = torch.as_tensor(domain_Y0, dtype=self.d_type, device=self.device) # bottom
-        self.domain_YN = torch.as_tensor(domain_YN, dtype=self.d_type, device=self.device) # top
+        # specify the space and time domains
+        self.domain_X0 = torch.as_tensor(domain_X0, dtype=self.dtype, device=self.device) # left side
+        self.domain_XN = torch.as_tensor(domain_XN, dtype=self.dtype, device=self.device) # right side
+        self.domain_Y0 = torch.as_tensor(domain_Y0, dtype=self.dtype, device=self.device) # bottom
+        self.domain_YN = torch.as_tensor(domain_YN, dtype=self.dtype, device=self.device) # top
         self.T = T
 
+        #specify whether or not the fields are changable
         self.temporal_evolution = temporal_evolution
         self.debug = DEBUG
 
@@ -79,39 +82,36 @@ class Wave_tracing():
         self.x = np.linspace(domain_X0, domain_XN, nx)
         self.y = np.linspace(domain_Y0, domain_YN, ny)
 
-        # Check the bathymetry
+        # make torch tensor of velocity field
+        U_t = torch.as_tensor(check_velocity_field(U,temporal_evolution,x=self.x,y=self.y).values, dtype=self.dtype, device=self.device)
+        V_t = torch.as_tensor(check_velocity_field(V,temporal_evolution,x=self.x,y=self.y).values, dtype=self.dtype, device=self.device)
+        
+        # Spatial gradients for every time snapshot
+        dU_dy, dU_dx = torch.gradient(U_t, spacing=(self.dy, self.dx), dim=(-2, -1))
+        dV_dy, dV_dx = torch.gradient(V_t, spacing=(self.dy, self.dx), dim=(-2, -1))
+
+        # Check the bathymetry and make it into a pytorch compatible tensor
         if d is not None:
-            self.d = check_bathymetry(d=d,x=self.x,y=self.y)
+            d_t = torch.as_tensor(check_bathymetry(d=d,x=self.x,y=self.y).values, dtype=self.dtype, device=self.device)
         else:
             d_static = 1e5
             logging.info(f'Hardcoding bathymetry to {d_static}m since not given.')
-            self.d = check_bathymetry(d=np.ones((ny,nx))*d_static,x=self.x,y=self.y)
+            d_t = torch.as_tensor(check_bathymetry(d=np.ones((ny,nx))*d_static,x=self.x,y=self.y).values, dtype=self.dtype, device=self.device)
+        d_t = torch.broadcast_to(d_t, U_t.shape)
 
-        # make xarray DataArray of velocity field
-        self.U = check_velocity_field(U,temporal_evolution,x=self.x,y=self.y)
-        self.V = check_velocity_field(V,temporal_evolution,x=self.x,y=self.y)
+        #Initialize the fields that are later interpolated for the ray time-integration
+        self.field = torch.stack([d_t, U_t, V_t, dU_dx, dU_dy, dV_dx, dV_dy], dim=1)
 
-        # Spatial gradients for every time snapshot
-        dU_dy, dU_dx = torch.gradient(torch.from_numpy(self.U.values), spacing=(self.dy, self.dx), dim=(-2, -1))
-        dV_dy, dV_dx = torch.gradient(torch.from_numpy(self.V.values), spacing=(self.dy, self.dx), dim=(-2, -1))
-
-        self.field = torch.from_numpy(
-            np.stack([
-                np.broadcast_to(self.d.values, self.U.values.shape),
-                self.U.values,
-                self.V.values,
-                dU_dx,
-                dU_dy,
-                dV_dx,
-                dV_dy
-            ], axis=1)
-        ).float()
-
-        self.rays = torch.tensor([0.,0.,0.,0.], requires_grad=True).repeat(nt, nb_wave_rays, 1)
+        #designate space for all the rays
+        self.initial_rays = torch.zeros(
+            (nb_wave_rays, 4),
+            dtype=self.dtype,
+            device=self.device,
+        )
 
         # Time
         self.dt = T/nt
-        self.nb_velocity_time_steps = len(self.U.time)
+        self.nb_velocity_time_steps = len(U_t)
         if not temporal_evolution:
             self.velocity_idt = np.zeros(nt,dtype=int)
             #logging.info('Vel idt : {}'.format(self.velocity_idt))
@@ -160,37 +160,7 @@ class Wave_tracing():
         array = np.asarray(array)
         idx = (np.abs(array - value)).argmin()
         return idx
-
-    # needs to be rewritten
-    def c_intrinsic(self,k,d,group_velocity=False):
-        """ Computing the intrinsic wave phase and group velocity according
-        to the general dispersion relation
-
-        Args:
-            k (float): wave number (numpy array)
-            d (float): depth (numpy array)
-            group_velocity (bool): returns group velocity (True) or phase
-                velocity (False)
-
-        Returns:
-            instrinsic velocity (float): group or phase velocity depending on
-                flag
-        """
-
-        g=self.g
-        dw_criteria = k*d>25
-
-        if dw_criteria.all():
-            c_in = np.sqrt(g/k)
-            n=0.5
-        else:
-            c_in = np.sqrt((g/k)*np.tanh(k*d)) #intrinsic
-            n = 0.5 * (1 + (2*k*d)/np.sinh(2*k*d))
-
-        if group_velocity:
-            return c_in*n
-        else:
-            return c_in
+    
 
     def wave(self,T,theta,d,U=0,V=0):
         """ Method computing wave number from initial wave period.
@@ -237,191 +207,102 @@ class Wave_tracing():
         return kx,ky
 
 
-    def set_initial_condition(self, wave_period, theta0,**kwargs):
-        """ Setting inital conditions for the domain. Support domain side and
-            initial x- and y-positions. However, side trumps initial position
-            if both are given.
+    def set_initial_condition(self, wave_period, theta0, **kwargs):
+        """Set initial positions and wavenumbers for all wave rays."""
 
-            args:
-            wave_period (float): Wave period.
-            theta0 (rad, float): Wave initial direction. In radians.
-                         (0,.5*pi,pi,1.5*pi) correspond to going
-                         (right, up, left, down).
-
-            **kwargs
-                incoming_wave_side (str): side for incoming wave direction
-                                            [left, right, top, bottom]
-                ipx (float, array of floats): initial position x
-                ipy (float, array of floats): initial position y
-        """
-
+        device = self.field.device
+        dtype = self.field.dtype
         nb_wave_rays = self.nb_wave_rays
 
-        valid_sides = ['left', 'right','top','bottom']
+        valid_sides = ["left", "right", "top", "bottom"]
 
-        if 'incoming_wave_side' in kwargs:
-            i_w_side = kwargs['incoming_wave_side']
+        # 1. Initial ray positions
+        if "incoming_wave_side" in kwargs:
+            side = kwargs["incoming_wave_side"]
 
-            if not i_w_side in valid_sides:
-                logger.info('Invalid initial side. Left will be used.')
-                i_w_side = 'left'
+            if side not in valid_sides:
+                logger.info("Invalid initial side. Left will be used.")
+                side = "left"
 
-            if i_w_side == 'left':
-                xs = torch.ones(nb_wave_rays)*self.domain_X0
-                ys = torch.linspace(self.domain_Y0, self.domain_YN, nb_wave_rays)
-
-            elif i_w_side == 'right':
-                xs = torch.ones(nb_wave_rays)*self.domain_XN
-                ys = torch.linspace(self.domain_Y0, self.domain_YN, nb_wave_rays)
-
-            elif i_w_side == 'top':
-                xs = torch.linspace(self.domain_X0, self.domain_XN, nb_wave_rays)
-                ys = torch.ones(nb_wave_rays)*self.domain_YN
-
-            elif i_w_side == 'bottom':
-                xs = torch.linspace(self.domain_X0, self.domain_XN, nb_wave_rays)
-                ys = torch.ones(nb_wave_rays)*self.domain_Y0
-
-        else:
-            logger.info('No initial side given. Try with discrete points')
-
-            ipx = kwargs.get('ipx', None)
-            ipy = kwargs.get('ipy', None)
-
-            if ipx is None and ipy is None:
-                logger.info('No initial position points given. Left will be used')
-                xs = np.ones(nb_wave_rays)*self.domain_X0
-                ys = np.linspace(self.domain_Y0, self.domain_YN, nb_wave_rays)
+            if side in ("left", "right"):
+                x_value = (self.domain_X0 if side == "left" else self.domain_XN)
+                xs = torch.full((nb_wave_rays,), x_value.item(), dtype=dtype, device=device)
+                ys = torch.linspace(self.domain_Y0.item(), self.domain_YN.item(), nb_wave_rays, dtype=dtype, device=device)
 
             else:
-                # First check initial position x
-                if np.isfinite(ipx).all():
-                    #Check if it is an array
-                    if isinstance(ipx,np.ndarray):
-                        assert nb_wave_rays == len(kwargs['ipx']), "Need same dimension on initial x-values"
-                        xs=ipx.copy()
-                    # if not, use it as single value
-                    else:
-                        ipx = np.ones(nb_wave_rays)*ipx
-                        xs=ipx.copy()
+                y_value = (self.domain_YN if side == "top" else self.domain_Y0)
+                xs = torch.linspace(self.domain_X0.item(), self.domain_XN.item(), nb_wave_rays, dtype=dtype, device=device)
+                ys = torch.full((nb_wave_rays,), y_value.item(), dtype=dtype, device=device)
 
-                if np.isfinite(ipy).all():
-                    if isinstance(ipy,np.ndarray):
-                        assert nb_wave_rays == len(kwargs['ipy']), "Need same dimension on initial x-values"
-                        ys=ipy.copy()
-                    else:
-                        ipy = np.ones(nb_wave_rays)*ipy
-                        ys=ipy.copy()
-
-        self.rays[0,:,0] = torch.tensor(xs)
-        self.rays[0,:,1] = torch.tensor(ys)
-
-        #Theta0
-        if type(theta0) is float or type(theta0) is int:
-            theta0 = np.ones(nb_wave_rays)*theta0
-        elif isinstance(theta0,np.ndarray):
-            assert nb_wave_rays == len(theta0), "Initial values must have same dimension as number of wave rays"
         else:
-            logger.error('Theta0 must be either float or numpy array. Terminating.')
-            sys.exit()
+            ipx = kwargs.get("ipx")
+            ipy = kwargs.get("ipy")
 
+            if ipx is None and ipy is None:
+                logger.info("No initial positions given. Using left boundary.")
+                xs = np.full(nb_wave_rays, self.domain_X0.item())
+                ys = np.linspace(self.domain_Y0.item(), self.domain_YN.item(), nb_wave_rays)
+            else:
+                if ipx is None or ipy is None:
+                    raise ValueError("Provide both ipx and ipy, or neither.")
 
-        # set inital wave properties
-        logger.error(f'{self.velocity_idt}, {len(self.velocity_idt)}')
+                xs = np.asarray(ipx)
+                ys = np.asarray(ipy)
+
+                if xs.ndim == 0:
+                    xs = np.full(nb_wave_rays, xs.item())
+                if ys.ndim == 0:
+                    ys = np.full(nb_wave_rays, ys.item())
+
+                if len(xs) != nb_wave_rays or len(ys) != nb_wave_rays:
+                    raise ValueError("ipx and ipy must each have nb_wave_rays values.")
+
+        # Normalize positions to tensors on the correct device.
+        xs = torch.as_tensor(xs, dtype=dtype, device=device).reshape(-1)
+        ys = torch.as_tensor(ys, dtype=dtype, device=device).reshape(-1)
+
+        # 2. Store initial positions
+        self.initial_rays[:, 0] = xs
+        self.initial_rays[:, 1] = ys
+
+        # 3. Initial directions
+        if isinstance(theta0, (float, int)):
+            theta0 = np.full(nb_wave_rays, theta0)
+        elif isinstance(theta0, np.ndarray):
+            if len(theta0) != nb_wave_rays:
+                raise ValueError("theta0 must have nb_wave_rays values.")
+        else:
+            raise TypeError("theta0 must be a float, int, or NumPy array.")
+
+        # 4. Read depth and velocity from self.field
+        idt = int(self.velocity_idt[0])
+
+        # Convert physical coordinates to grid indices.
+        ix = torch.round((xs - self.domain_X0) / (self.domain_XN - self.domain_X0) * (self.nx - 1)).long().clamp(0, self.nx - 1)
+
+        iy = torch.round((ys - self.domain_Y0) / (self.domain_YN - self.domain_Y0) * (self.ny - 1)).long().clamp(0, self.ny - 1)
+
+        # self.field layout: (time, 7, ny, nx)
+        depth = self.field[idt, 0, iy, ix]
+        U = self.field[idt, 1, iy, ix]
+        V = self.field[idt, 2, iy, ix]
+
+        # 5. Calculate initial wavenumbers
+        # self.wave() uses NumPy/SciPy, so calculate on the CPU.
+        depth_cpu = depth.detach().cpu().numpy()
+        U_cpu = U.detach().cpu().numpy()
+        V_cpu = V.detach().cpu().numpy()
+
+        kx = np.empty(nb_wave_rays)
+        ky = np.empty(nb_wave_rays)
+
         for i in range(nb_wave_rays):
-            ray_kx, ray_ky = self.wave(T=wave_period,
-                                        theta=theta0[i],
-                                        d=self.d.sel(y=ys[i],x=xs[i],method='nearest').values,
-                                        U=self.U.isel(time=self.velocity_idt[0]).sel(y=ys[i],x=xs[i],method='nearest').values,
-                                        V=self.V.isel(time=self.velocity_idt[0]).sel(y=ys[i],x=xs[i],method='nearest').values
-                                        )
-            self.rays[0,i,2:] = torch.tensor([ray_kx, ray_ky])
+            kx[i], ky[i] = self.wave(T=wave_period, theta=theta0[i], d=depth_cpu[i], U=U_cpu[i], V=V_cpu[i])
+
+        self.initial_rays[:, 2] = torch.as_tensor(kx, dtype=dtype, device=device)
+        self.initial_rays[:, 3] = torch.as_tensor(ky, dtype=dtype, device=device)
 
         #Check the CFL condition
-
-    #-------------------------------------------------------------------------------------------------------------------------------------------------
-    # PYTORCH FUNCTIONALITY HERE (WITHOUT DELETING)
-    #------------------------------------------------------------------------------------------------------------------------------------------------–
-
-    class ray_properties():
-        # Helper class that keeps all interesting ray properties needed for generating the end dataset in one place
-        def __init__(self, k, k_norm, d, U, dU, cg=None):
-            self.k = k
-            self.k_norm = k_norm
-            self.d = d
-            self.U = U
-            self.dU = dU
-            self.cg = cg
-    
-    def find_k(self, Theta, g_metric):
-        # Theta: (N, 2)
-        # g_metric: (2, 2)
-        return torch.einsum("ni,ij->nj", Theta, g_metric)
-
-    def find_sigma(self, k_norm, d):
-        return torch.sqrt(self.g * k_norm * torch.tanh(k_norm * d))
-
-    def find_U_and_d(self, positions, idt):
-        # positions: (N, 2)
-
-        x = (2*(positions[:, 0]-self.domain_X0) / (self.domain_XN-self.domain_X0)-1)
-        y = (2*(positions[:, 1]-self.domain_Y0) / (self.domain_YN-self.domain_Y0)-1)
-
-        # We need to reshape the array, since the interpolation step is batched
-        # (N, 2) -> (1, N, 1, 2) 
-        grid = torch.stack([x, y], dim=-1).reshape(1, -1, 1, 2)
-
-        interpolated = torch.nn.functional.grid_sample(self.field[idt].unsqueeze(0), grid, 
-                                                       mode="bilinear", align_corners=True)
-
-        # We need to reshape the array back, removing redundant layers
-        # (1, 3, N, 1) -> (N, 3)
-        interpolated = interpolated[0, :, :, 0].T
-
-        local_d = interpolated[:, 0]
-        local_U = interpolated[:, 1:3]
-        local_dU = interpolated[:, 3:7]
-
-        return local_d, local_U, local_dU
-
-    def Omega(self, rays, idt):
-        # rays: (N, 4)
-        #       x, y, kx, ky
-
-        positions = rays[:, :2]
-        Theta = rays[:, 2:]
-
-        d, U, dU = self.find_U_and_d(positions, idt)
-
-        # In the future, these could be aggregated within the metric class to avoid multiplying over inverses every time
-        g_im_h = self.metric.find_g_im_h(positions[0])
-        g_nj = self.metric.find_gnj(positions[0])
-        J_jm = self.metric.find_J_jm(positions[0])
-
-        k = self.find_k(Theta, g_nj)
-        k_norm = torch.linalg.vector_norm(k, dim=1)
-
-        sigma = self.find_sigma(k_norm, d)
-
-        current_term = torch.einsum("im,mj,ni,nj->n", g_im_h, J_jm, U, k)
-
-        # Neatly pack away all the additional properties in a new data structure
-        properties = self.ray_properties(k, k_norm, d, U, dU)
-
-        return sigma + current_term, properties
-
-    def dOmega(self, rays, idt):
-        rays = rays.clone().detach().requires_grad_(True)
-
-        omega, properties = self.Omega(rays, idt)
-
-        sigma = self.find_sigma(properties.k_norm, properties.d)
-
-        dOmega = torch.autograd.grad(omega.sum(), rays, create_graph=False, allow_unused=False)[0]
-        properties.cg = torch.autograd.grad(sigma.sum(), properties.k_norm, create_graph=False, allow_unused=False)[0]
-
-        return dOmega, properties
-
     
     def initialize_ray_history(self):
         """Allocate histories indexed by timestep and stable ray ID."""
@@ -434,14 +315,12 @@ class Wave_tracing():
                  "ray_theta", "ray_cg", "ray_depth",
                  "ray_dudx", "ray_dvdy", "ray_dudy", "ray_dvdx"]
 
-        self.property_history = self.property_history = {name: torch.full((nt, nr), float("nan"), 
-                                                                          dtype=torch.float32, device=self.device) 
-                                                                          for name in names}
+        self.property_history = {name: torch.full((nt, nr), float("nan"), dtype=torch.float32, device=self.device) for name in names}
 
         # Preserve the initial states in the original tensor format.
-        self.rays_history = torch.full((nt, nr, 4), float("nan"), dtype=self.rays.dtype, device=self.rays.device)
+        self.rays_history = torch.full((nt, nr, 4), float("nan"), dtype=self.dtype, device=self.device)
 
-        self.rays_history[0] = self.rays[0].detach()
+        self.rays_history[0] = self.initial_rays.detach()
 
         # Keep the original public attributes available as lists.
         for name in names:
@@ -475,10 +354,10 @@ class Wave_tracing():
         }
 
         # Convert stable ray IDs to a tensor.
-        ray_ids_t = ray_ids.to(device=self.device, dtype=torch.long)
+ #       ray_ids = ray_ids.to(dtype=torch.long)
 
         # Validate every field before writing.
-        n_active = len(ray_ids_t)
+        n_active = len(ray_ids)
 
         for name, value in values.items():
             if value.ndim != 1 or len(value) != n_active:
@@ -486,16 +365,16 @@ class Wave_tracing():
 
         # Store each property in its original ray-ID column.
         for name, value in values.items():
-            self.property_history[name][timestep, ray_ids_t] = (value.detach().to(device=self.device, dtype=torch.float32))
+            self.property_history[name][timestep, ray_ids] = (value.detach().to(dtype=torch.float32))
 
         # Derive the direction from the stored wavenumber components.
-        kx = self.property_history["ray_kx"][timestep, ray_ids_t]
-        ky = self.property_history["ray_ky"][timestep, ray_ids_t]
+        kx = self.property_history["ray_kx"][timestep, ray_ids]
+        ky = self.property_history["ray_ky"][timestep, ray_ids]
 
-        self.property_history["ray_theta"][timestep, ray_ids_t] = (torch.atan2(ky, kx))
+        self.property_history["ray_theta"][timestep, ray_ids] = (torch.atan2(ky, kx))
 
 
-    def solve(self, solver=None):
+    def solve(self, solver=None, derivative_scheme = Autoderivative):
         """
         Trace rays and store all properties at their corresponding
         timestep and original ray ID.
@@ -506,14 +385,11 @@ class Wave_tracing():
 
         nr = self.nb_wave_rays
         nt = self.nt
-        dt = self.T / nt
 
-        active_ids = torch.arange(nr, dtype=torch.long)
-        active_rays = self.rays[0].detach().clone()
+        scheme = derivative_scheme(self)
 
-        # Preserve these lists for compatibility with existing code.
-        self.active_ray_indices = [active_ids.clone()]
-        self.active_rays = [active_rays.clone()]
+        active_ids = torch.arange(nr, dtype=torch.long, device=self.device)
+        active_rays = active_rays = self.initial_rays.clone()
 
         for n in range(nt):
             #check if any rays still exist at all
@@ -525,7 +401,7 @@ class Wave_tracing():
             idt = int(self.velocity_idt[min(n, len(self.velocity_idt) - 1)])
 
             # Evaluate the current state and its properties together.
-            dOmega, properties = self.dOmega(active_rays, idt)
+            derivative, properties = scheme.evolution(active_rays, idt)
 
             # Verify that properties match the active rays.
             count = len(active_ids)
@@ -540,11 +416,7 @@ class Wave_tracing():
             if n == nt - 1:
                 break
 
-            # dOmega is ordered [dkx, dky, dx, dy].
-            derivative = dOmega[:, [2, 3, 0, 1]]
-            derivative = derivative * torch.tensor([1., 1., -1., -1.], dtype=active_rays.dtype, device=active_rays.device)
-
-            next_rays = active_rays + dt * derivative
+            next_rays = active_rays + self.dt* derivative
 
             # Remove rays with any non-finite state component.
             valid = torch.isfinite(next_rays).all(dim=1)
@@ -555,9 +427,6 @@ class Wave_tracing():
             # Store the new positions at the next timestep.
             if len(active_ids) > 0:
                 self.rays_history[n + 1, active_ids] = active_rays
-
-            self.active_ray_indices.append(active_ids.clone())
-            self.active_rays.append(active_rays.clone())
 
         # Synchronize the main state tensor with the stored trajectory.
         self.rays = self.rays_history

@@ -3,35 +3,45 @@ import torch
 class CartesianMetric():
 # All Metric related stuff for the Cartesian case
 
-    def find_g_im_h(self, position):
-        g_11 = 1.
-        g_12 = 0.
-        g_21 = 0.
-        g_22 = 1.
+    def find_g_im(self, position):
+        N = position.shape[0]
+        g_11 = torch.ones(N, dtype=position.dtype, device=position.device)
+        g_12 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        g_21 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        g_22 = torch.ones(N, dtype=position.dtype, device=position.device)
         return torch.stack([
-            torch.tensor([g_11, g_12]),
-            torch.tensor([g_21, g_22])
-        ])
+            torch.stack([g_11, g_12], dim=-1),
+            torch.stack([g_21, g_22], dim=-1)
+        ], dim=-2)
 
     def find_gnj(self, position):
-        g_11 = 1.
-        g_12 = 0.
-        g_21 = 0.
-        g_22 = 1.
+        N = position.shape[0]
+        g_11 = torch.ones(N, dtype=position.dtype, device=position.device)
+        g_12 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        g_21 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        g_22 = torch.ones(N, dtype=position.dtype, device=position.device)
         return torch.stack([
-            torch.tensor([g_11, g_12]),
-            torch.tensor([g_21, g_22])
-        ])
+            torch.stack([g_11, g_12], dim=-1),
+            torch.stack([g_21, g_22], dim=-1)
+        ], dim=-2)
 
     def find_J_jm(self, position):
-        J_11 = 1.
-        J_12 = 0.
-        J_21 = 0.
-        J_22 = 1.
+        N = position.shape[0]
+        J_11 = torch.ones(N, dtype=position.dtype, device=position.device)
+        J_12 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        J_21 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        J_22 = torch.ones(N, dtype=position.dtype, device=position.device)
         return torch.stack([
-            torch.tensor([J_11, J_12]),
-            torch.tensor([J_21, J_22])
-        ])
+            torch.stack([J_11, J_12], dim=-1),
+            torch.stack([J_21, J_22], dim=-1)
+        ], dim=-2)
+
+    def find_h_i(self, position):
+        N = position.shape[0]
+        h_1 = torch.ones(N, dtype=position.dtype, device=position.device)
+        h_2 = torch.ones(N, dtype=position.dtype, device=position.device)
+        return torch.stack([h_1, h_2], dim=-1)
+
 
 
 class SphericalMetric():
@@ -41,34 +51,44 @@ class SphericalMetric():
         self.R = 6371e6
         pass
 
-    def find_g_im_h(self, position):
+    def find_g_im(self, position):
+        N = position.shape[0]
         lon, lat = position
-        g_h11 = self.R*torch.cos(lat) 
-        g_h12 = 0.
-        g_h21 = 0.
-        g_h22 = self.R
+        g_11 = (self.R*torch.cos(lat))**2 
+        g_12 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        g_21 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        g_22 = torch.ones(N, dtype=position.dtype, device=position.device)*(self.R**2)
         return torch.stack([
-            torch.tensor([g_h11, g_h12]),
-            torch.tensor([g_h21, g_h22])
-        ])
-    
+            torch.stack([g_11, g_12], dim=-1),
+            torch.stack([g_21, g_22], dim=-1)
+        ], dim=-2)
+
     def find_gnj(self, position):
+        N = position.shape[0]
         lon, lat = position
         g_11 = 1/(self.R*torch.cos(lat))**2
-        g_12 = 0.
-        g_21 = 0.
-        g_22 = 1/self.R**2
+        g_12 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        g_21 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        g_22 = torch.ones(N, dtype=position.dtype, device=position.device)/(self.R**2)
         return torch.stack([
-            torch.tensor([g_11, g_12]),
-            torch.tensor([g_21, g_22])
-        ])
+            torch.stack([g_11, g_12], dim=-1),
+            torch.stack([g_21, g_22], dim=-1)
+        ], dim=-2)
 
     def find_J_jm(self, position):
-        J_11 = 1.
-        J_12 = 0.
-        J_21 = 0.
-        J_22 = 1.
+        N = position.shape[0]
+        J_11 = torch.ones(N, dtype=position.dtype, device=position.device)
+        J_12 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        J_21 = torch.zeros(N, dtype=position.dtype, device=position.device)
+        J_22 = torch.ones(N, dtype=position.dtype, device=position.device)
         return torch.stack([
-            torch.tensor([J_11, J_12]),
-            torch.tensor([J_21, J_22])
-        ])
+            torch.stack([J_11, J_12], dim=-1),
+            torch.stack([J_21, J_22], dim=-1)
+        ], dim=-2)
+
+    def find_h_i(self, position):
+        N = position.shape[0]
+        lon, lat = position
+        h_1 = 1/(self.R*torch.cos(lat))
+        h_2 = torch.ones(N, dtype=position.dtype, device=position.device)/self.R
+        return torch.stack([h_1, h_2], dim=-1)
