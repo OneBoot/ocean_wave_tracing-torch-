@@ -58,7 +58,6 @@ class Autoderivative():
 
         return local_d, local_U, local_dU
 
-
     def Omega(self, rays, idt):
         # rays: (N, 4)
         #       x, y, kx, ky
@@ -86,7 +85,6 @@ class Autoderivative():
 
         return sigma + current_term, properties
 
-
     def dOmega(self, rays, idt):
         rays = rays.clone().detach().requires_grad_(True)
 
@@ -99,7 +97,6 @@ class Autoderivative():
 
         return dOmega, properties
 
-
     def evolution(self, active_rays, idt):
         """
         Function that returns the time derivative of the rays to be input to the solver
@@ -111,3 +108,12 @@ class Autoderivative():
         derivative = derivative * torch.tensor([1., 1., -1., -1.], dtype=active_rays.dtype, device=active_rays.device)
 
         return derivative, properties
+
+
+class Legacyderivative():
+    """
+    unfinished class that should serve as the parent class of the two legacy derivative solvers, but with 
+    Advection and Wavenumber evolution converted to work with the new 4-vector workflow
+    """
+    def __init__(self, wave_tracing):
+        self.wt = wave_tracing
