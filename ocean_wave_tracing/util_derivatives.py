@@ -73,8 +73,12 @@ class Autoderivative():
         J_jm = self.wt.metric.find_J_jm(positions)
         h_i = self.wt.metric.find_h_i(positions)
 
+        # Contravariant components, retained for the current term.
         k = torch.einsum("ni,nij->nj", Theta, g_nj)
-        k_norm = torch.linalg.vector_norm(k, dim=1)
+
+        # Physical wavenumber magnitude: sqrt(Theta_i g^ij Theta_j).
+        k_norm_sq = torch.einsum("ni,nij,nj->n", Theta, g_nj, Theta)
+        k_norm = torch.sqrt(torch.clamp(k_norm_sq, min=0.0))
 
         sigma = self.find_sigma(k_norm, d)
 

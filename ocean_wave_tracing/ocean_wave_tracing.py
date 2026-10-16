@@ -28,7 +28,7 @@ class Wave_tracing():
     """
     def __init__(self, U, V,  nx, ny, nt, T, dx, dy,
                  nb_wave_rays, domain_X0, domain_XN, domain_Y0, domain_YN,
-                 temporal_evolution=False, metric=CartesianMetric(),
+                 temporal_evolution=False, metric=CartesianMetric(), derivative_scheme=Autoderivative,
                  d=None,DEBUG=False,**kwargs):
         """
         Args:
@@ -53,6 +53,7 @@ class Wave_tracing():
         self.dtype = torch.float32
 
         self.metric = metric
+        self.derivative_scheme = derivative_scheme(self)
 
         self.g = 9.81
         self.nx = nx
@@ -162,10 +163,14 @@ class Wave_tracing():
         return idx
     
 
-    def wave(self,T,theta,d,U=0,V=0):
+    def wave(self,T,theta,d,U=0,V=0,xs=0,ys=0):
         """ Method computing wave number from initial wave period.
         Solving implicitly for the wave number k, with initial guess from the approximate
         wave number according to Eckart (1952)
+
+        ===================================================================================================
+        NEEDS TO BE MODIFIED TO DEPEND ON THE SOLVER FUNCTION OR AT LEAST THE METRIC
+        ===================================================================================================
 
         Args:
             T (float): Wave period
@@ -192,10 +197,15 @@ class Wave_tracing():
 
         from scipy.optimize import fsolve
 
-        def k_imp(kk, d=d, g=g,T=T,U=U,V=V):
+        # CAN PROBABLY BE REPLACED BY OMEGA; BUT THIS NEEDS TO BE FIGURED OUT
+        # NAMELY; A GUESS FOR THE INITIAL RAY POSITION NEEDS TO BE MADE
+
+        def k_imp(kk):
             kx_ap = kk*np.cos(theta)
             ky_ap = kk*np.sin(theta)
-            return (np.sqrt((g*kk * np.tanh(kk*d)))+ kx_ap*U + ky_ap*V ) - (2*np.pi)/T 
+            test_ray = torch.as_tensor([[xs.item(), ys.item(), kx_ap.item(), ky_ap.item()]])
+            Omega, _ = self.derivative_scheme.Omega(test_ray, 0)
+            return Omega - (2*np.pi)/T 
         
         
         k = fsolve(k_imp,k_approx)
@@ -208,7 +218,8 @@ class Wave_tracing():
 
 
     def set_initial_condition(self, wave_period, theta0, **kwargs):
-        """Set initial positions and wavenumbers for all wave rays."""
+        """Set initial positions and wavenumbers for all wave rays.
+        """
 
         device = self.field.device
         dtype = self.field.dtype
@@ -279,7 +290,6 @@ class Wave_tracing():
 
         # Convert physical coordinates to grid indices.
         ix = torch.round((xs - self.domain_X0) / (self.domain_XN - self.domain_X0) * (self.nx - 1)).long().clamp(0, self.nx - 1)
-
         iy = torch.round((ys - self.domain_Y0) / (self.domain_YN - self.domain_Y0) * (self.ny - 1)).long().clamp(0, self.ny - 1)
 
         # self.field layout: (time, 7, ny, nx)
@@ -297,7 +307,7 @@ class Wave_tracing():
         ky = np.empty(nb_wave_rays)
 
         for i in range(nb_wave_rays):
-            kx[i], ky[i] = self.wave(T=wave_period, theta=theta0[i], d=depth_cpu[i], U=U_cpu[i], V=V_cpu[i])
+            kx[i], ky[i] = self.wave(T=wave_period, theta=theta0[i], d=depth_cpu[i], U=U_cpu[i], V=V_cpu[i], xs=xs[i], ys=ys[i])
 
         self.initial_rays[:, 2] = torch.as_tensor(kx, dtype=dtype, device=device)
         self.initial_rays[:, 3] = torch.as_tensor(ky, dtype=dtype, device=device)
@@ -374,7 +384,7 @@ class Wave_tracing():
         self.property_history["ray_theta"][timestep, ray_ids] = (torch.atan2(ky, kx))
 
 
-    def solve(self, solver=None, derivative_scheme = Autoderivative):
+    def solve(self, solver=None):
         """
         Trace rays and store all properties at their corresponding
         timestep and original ray ID.
@@ -386,7 +396,7 @@ class Wave_tracing():
         nr = self.nb_wave_rays
         nt = self.nt
 
-        scheme = derivative_scheme(self)
+        scheme = self.derivative_scheme
 
         active_ids = torch.arange(nr, dtype=torch.long, device=self.device)
         active_rays = active_rays = self.initial_rays.clone()
@@ -558,7 +568,6 @@ class Wave_tracing():
 
         # Return (ray, time), matching the original method's output.
         return np.asarray(lons).T, np.asarray(lats).T
-
 
     
     def get_ray_curvature(self,decomposed=False):
