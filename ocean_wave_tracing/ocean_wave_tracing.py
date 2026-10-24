@@ -14,7 +14,7 @@ from .util_solvers import Advection, WaveNumberEvolution, RungeKutta4
 from .util_methods import make_xarray_dataArray, to_xarray_ds, check_velocity_field, check_bathymetry
 
 from .util_metric import CartesianMetric
-from .util_derivatives import Autoderivative
+from .util_derivatives import Autoderivative#, Autoderivative_ESPG
 import torch
 
 
@@ -29,7 +29,7 @@ class Wave_tracing():
     def __init__(self, U, V,  nx, ny, nt, T, dx, dy,
                  nb_wave_rays, domain_X0, domain_XN, domain_Y0, domain_YN,
                  temporal_evolution=False, metric=CartesianMetric(), derivative_scheme=Autoderivative,
-                 d=None,DEBUG=False,**kwargs):
+                 d=None,DEBUG=False, **kwargs):
         """
         Args:
             U (float): eastward velocity 2D field
@@ -54,6 +54,7 @@ class Wave_tracing():
 
         self.metric = metric
         self.derivative_scheme = derivative_scheme(self)
+        #self.ESPG_needed = ESPG_needed
 
         self.g = 9.81
         self.nx = nx
@@ -79,9 +80,13 @@ class Wave_tracing():
         self.temporal_evolution = temporal_evolution
         self.debug = DEBUG
 
+
         # Setting up X and Y domain
         self.x = np.linspace(domain_X0, domain_XN, nx)
         self.y = np.linspace(domain_Y0, domain_YN, ny)
+
+        self.U = check_velocity_field(U,temporal_evolution,x=self.x,y=self.y).values
+        self.V = check_velocity_field(V,temporal_evolution,x=self.x,y=self.y).values
 
         # make torch tensor of velocity field
         U_t = torch.as_tensor(check_velocity_field(U,temporal_evolution,x=self.x,y=self.y).values, dtype=self.dtype, device=self.device)
@@ -91,13 +96,16 @@ class Wave_tracing():
         dU_dy, dU_dx = torch.gradient(U_t, spacing=(self.dy, self.dx), dim=(-2, -1))
         dV_dy, dV_dx = torch.gradient(V_t, spacing=(self.dy, self.dx), dim=(-2, -1))
 
+
         # Check the bathymetry and make it into a pytorch compatible tensor
         if d is not None:
-            d_t = torch.as_tensor(check_bathymetry(d=d,x=self.x,y=self.y).values, dtype=self.dtype, device=self.device)
+            self.d = check_bathymetry(d=d,x=self.x,y=self.y).values
+            d_t = torch.as_tensor(self.d, dtype=self.dtype, device=self.device)
         else:
             d_static = 1e5
             logging.info(f'Hardcoding bathymetry to {d_static}m since not given.')
-            d_t = torch.as_tensor(check_bathymetry(d=np.ones((ny,nx))*d_static,x=self.x,y=self.y).values, dtype=self.dtype, device=self.device)
+            self.d = check_bathymetry(d=np.ones((ny,nx))*d_static,x=self.x,y=self.y).values
+            d_t = torch.as_tensor(self.d, dtype=self.dtype, device=self.device)
         d_t = torch.broadcast_to(d_t, U_t.shape)
 
         #Initialize the fields that are later interpolated for the ray time-integration
@@ -201,9 +209,20 @@ class Wave_tracing():
         # NAMELY; A GUESS FOR THE INITIAL RAY POSITION NEEDS TO BE MADE
 
         def k_imp(kk):
-            kx_ap = kk*np.cos(theta)
-            ky_ap = kk*np.sin(theta)
-            test_ray = torch.as_tensor([[xs.item(), ys.item(), kx_ap.item(), ky_ap.item()]])
+            k = torch.as_tensor(kk)
+            pos = torch.as_tensor([[xs, ys]], dtype=self.dtype, device=self.device)
+            #if self.ESPG_needed:
+            #    print("of course chef")
+            #    pos = self.derivative_scheme.transform(pos)
+
+            k_ap = torch.stack([k*np.cos(theta), k*np.sin(theta)], dim=-1)
+            # Need to perform a scaling to convert the physical wavevectors into canonical wavevectors
+
+            h_i = self.metric.find_h_i(pos)
+            k_ap_scaled = k_ap/h_i
+            k_ap_scaled = k_ap_scaled.to(dtype=self.dtype, device=self.device)
+
+            test_ray = torch.cat([pos, k_ap_scaled], dim=1)
             Omega, _ = self.derivative_scheme.Omega(test_ray, 0)
             return Omega - (2*np.pi)/T 
         
@@ -272,10 +291,18 @@ class Wave_tracing():
         xs = torch.as_tensor(xs, dtype=dtype, device=device).reshape(-1)
         ys = torch.as_tensor(ys, dtype=dtype, device=device).reshape(-1)
 
+        # Convert physical coordinates to grid indices.
+        ix = torch.round((xs - self.domain_X0) / (self.domain_XN - self.domain_X0) * (self.nx - 1)).long().clamp(0, self.nx - 1)
+        iy = torch.round((ys - self.domain_Y0) / (self.domain_YN - self.domain_Y0) * (self.ny - 1)).long().clamp(0, self.ny - 1)
+
+#        if self.ESPG_needed:
+ #           print("yes chef")
+  #          xs, ys =  torch.tensor(self.derivative_scheme.backtransformer.transform(xs, ys), dtype=torch.float32)
+
         # 2. Store initial positions
         self.initial_rays[:, 0] = xs
         self.initial_rays[:, 1] = ys
-
+        
         # 3. Initial directions
         if isinstance(theta0, (float, int)):
             theta0 = np.full(nb_wave_rays, theta0)
@@ -287,10 +314,6 @@ class Wave_tracing():
 
         # 4. Read depth and velocity from self.field
         idt = int(self.velocity_idt[0])
-
-        # Convert physical coordinates to grid indices.
-        ix = torch.round((xs - self.domain_X0) / (self.domain_XN - self.domain_X0) * (self.nx - 1)).long().clamp(0, self.nx - 1)
-        iy = torch.round((ys - self.domain_Y0) / (self.domain_YN - self.domain_Y0) * (self.ny - 1)).long().clamp(0, self.ny - 1)
 
         # self.field layout: (time, 7, ny, nx)
         depth = self.field[idt, 0, iy, ix]
@@ -383,7 +406,6 @@ class Wave_tracing():
 
         self.property_history["ray_theta"][timestep, ray_ids] = (torch.atan2(ky, kx))
 
-
     def solve(self, solver=None):
         """
         Trace rays and store all properties at their corresponding
@@ -427,7 +449,6 @@ class Wave_tracing():
                 break
 
             next_rays = active_rays + self.dt* derivative
-
             # Remove rays with any non-finite state component.
             valid = torch.isfinite(next_rays).all(dim=1)
 
@@ -536,7 +557,7 @@ class Wave_tracing():
                     y0, yn = ys[idy],ys[idy+1]
                     counter+=1
                     valid_x = (self.ray_x[i,:]>x0)*(self.ray_x[i,:]<xn)
-                    if (np.any((self.ray_y[i,:][valid_x]>y0)*(self.ray_y[i,:][valid_x]<yn))):
+                    if (torch.any((self.ray_y[i,:][valid_x]>y0)*(self.ray_y[i,:][valid_x]<yn))):
                         hm[idy,idx]+=1
 
         if plot:

@@ -9,3 +9,5 @@ current_forcing/
 __pycache__/
 figures/
 old/
+example_ambient_conditions/
+example_datasets/

@@ -3,6 +3,10 @@ Standalone methods for computing the time derivative of the wave vector
 """
 import torch
 
+from pyproj import CRS, Transformer
+
+proj4Norkyst = "+proj=stere +lat_0=90 +lat_ts=60 +lon_0=70 +x_0=3369600 +y_0=1844800 +a=6378137 +b=6356752.3142 +units=m +no_defs +type=crs"
+
 class ray_properties():
     # Helper class that keeps all interesting ray properties needed for generating the end dataset in one place
     def __init__(self, k, k_norm, d, U, dU, cg=None):
@@ -29,14 +33,17 @@ class Autoderivative():
         return torch.sqrt(self.wt.g * k_norm * torch.tanh(k_norm * d))
 
     def find_U_and_d(self, positions, idt):
-        # positions: (N, 2)
-        device = positions.device
-        dtype = positions.dtype
 
-        X0 = self.wt.domain_X0.to(device=device, dtype=dtype)
-        XN = self.wt.domain_XN.to(device=device, dtype=dtype)
-        Y0 = self.wt.domain_Y0.to(device=device, dtype=dtype)
-        YN = self.wt.domain_YN.to(device=device, dtype=dtype)
+        #This can be computed once, and never again after that
+        # positions: (N, 2)
+
+        field = self.wt.field
+        positions = positions.to(dtype=field.dtype, device=field.device)
+
+        X0 = self.wt.domain_X0.to(device=field.device, dtype=field.dtype)
+        XN = self.wt.domain_XN.to(device=field.device, dtype=field.dtype)
+        Y0 = self.wt.domain_Y0.to(device=field.device, dtype=field.dtype)
+        YN = self.wt.domain_YN.to(device=field.device, dtype=field.dtype)
 
         x = 2 * (positions[:, 0] - X0) / (XN - X0) - 1
         y = 2 * (positions[:, 1] - Y0) / (YN - Y0) - 1
@@ -111,9 +118,31 @@ class Autoderivative():
         derivative = dOmega[:, [2, 3, 0, 1]]
         derivative = derivative * torch.tensor([1., 1., -1., -1.], dtype=active_rays.dtype, device=active_rays.device)
 
+        print(derivative)
+
         return derivative, properties
 
+"""#Class that allows for implementation in the curvilinear grid while maintaining lat, lon coordinates
+class Autoderivative_ESPG(Autoderivative):
 
+    def __init__(self, wave_tracing, projection=proj4Norkyst):
+        Autoderivative.__init__(self, wave_tracing)
+        #initialize the transformer
+        self.transformer = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_proj4(projection), always_xy=True)
+        self.backtransformer = Transformer.from_crs(CRS.from_proj4(projection), CRS.from_epsg(4326), always_xy=True)
+
+    def find_U_and_d(self, positions, idt):
+        positions_transformed = self.transform(positions)
+        return super().find_U_and_d(positions_transformed, idt)
+
+    def transform(self, positions):
+        positions_detached = positions.detach().numpy()
+        positions_transformed = torch.tensor(self.transformer.transform(positions_detached[:,0], positions_detached[:,1]), dtype=torch.float32).T
+        return positions_transformed
+#    def Omega(self, rays, idt):
+#        omega, properties = super().Omega(rays, idt)
+#        return torch.rad2deg(omega), properties
+"""
 class Legacyderivative():
     """
     unfinished class that should serve as the parent class of the two legacy derivative solvers, but with 
