@@ -20,7 +20,6 @@ def make_xarray_dataArray(var,t,rays,name,attribs):
                       name=name)
     return vo
 
-
 def to_xarray_ds(v,latlon=False):
     """
     Return xarray Dataset (ds) object
@@ -39,7 +38,6 @@ def to_xarray_ds(v,latlon=False):
         ds['ray_lat'].attrs = {'comment':'No latitude values provided'}
         ds['ray_lon'].attrs = {'comment':'No longitude values provided'}
     return ds
-
 
 def check_velocity_field(U,temporal_evolution,x,y):
     """ Method checking and fixing velocity field input
@@ -128,4 +126,3 @@ def check_WKB_valitidy_depht(k,d,dx):
     criteria = grad_d_over_d/k
 
     return criteria
-
