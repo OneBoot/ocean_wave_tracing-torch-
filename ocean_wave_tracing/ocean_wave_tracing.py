@@ -27,9 +27,9 @@ class Wave_tracing():
     optics approximation.
     """
     def __init__(self, U, V,  nx, ny, nt, T, dx, dy,
-                 nb_wave_rays, domain_X0, domain_XN, domain_Y0, domain_YN,
+                 nb_wave_rays, domain_X0, domain_XN, domain_Y0, domain_YN, solver=None,
                  temporal_evolution=False, metric=CartesianMetric(), projection=Identity(), derivative_scheme=Autoderivative,
-                 d=None,DEBUG=False, **kwargs):
+                 d=None,DEBUG=False, d_cutoff=0, **kwargs):
         """
         Args:
             U (float): eastward velocity 2D field
@@ -50,12 +50,21 @@ class Wave_tracing():
 
         #Should be changeable later
         self.device = torch.device("cpu")#
-        self.dtype = torch.float32
+        self.dtype = torch.float64
 
         self.metric = metric
         self.derivative_scheme = derivative_scheme(self)
+        rhs = lambda rays, idt: self.derivative_scheme.evolution(rays, idt)[0]
+
+        if solver is None:
+            self.solver = RungeKutta4(rhs)
+        else:
+            self.solver = solver(rhs)
+
         self.projection = projection
         #self.ESPG_needed = ESPG_needed
+
+        self.d_cutoff = d_cutoff
 
         self.g = 9.81
         self.nx = nx
@@ -159,8 +168,30 @@ class Wave_tracing():
         y = y.reshape(-1)
 
         # Identify positions inside the domain BEFORE clamping.
-        valid = (torch.isfinite(x) & torch.isfinite(y)
-                  & (x >= self.domain_X0) & (x <= self.domain_XN) & (y >= self.domain_Y0) & (y <= self.domain_YN))
+        #valid = (torch.isfinite(x) & torch.isfinite(y)
+        #          & (x >= self.domain_X0) & (x <= self.domain_XN) & (y >= self.domain_Y0) & (y <= self.domain_YN))
+        # Numerical tolerance for projection round-tripping.
+        # The tolerance is deliberately small compared with the grid spacing.
+        scale = max(
+            abs(self.domain_X0.item()),
+            abs(self.domain_XN.item()),
+            abs(self.domain_Y0.item()),
+            abs(self.domain_YN.item()),
+            1.0
+        )
+
+        tol = 1e-8 * scale
+
+        # Identify positions inside the domain, allowing for small
+        # numerical errors introduced by the coordinate transformation.
+        valid = (
+            torch.isfinite(x)
+            & torch.isfinite(y)
+            & (x >= self.domain_X0 - tol)
+            & (x <= self.domain_XN + tol)
+            & (y >= self.domain_Y0 - tol)
+            & (y <= self.domain_YN + tol)
+        )
 
         # Convert coordinates to fractional grid indices.
         ix = (x - self.domain_X0) * (self.nx - 1) / (self.domain_XN - self.domain_X0)
@@ -170,12 +201,13 @@ class Wave_tracing():
         ix = torch.nan_to_num(ix, nan=0.0, posinf=0.0, neginf=0.0).clamp(0, self.nx - 1)
         iy = torch.nan_to_num(iy, nan=0.0, posinf=0.0, neginf=0.0).clamp(0, self.ny - 1)
 
+        # Compute the lower indices of the gridcell to be interpolated over
         x0 = torch.floor(ix).long()
         y0 = torch.floor(iy).long()
-
+        # Compute the upper indices of the gridcell to be interpolated over
         x1 = (x0 + 1).clamp(max=self.nx - 1)
         y1 = (y0 + 1).clamp(max=self.ny - 1)
-
+        # retrieve the per-cell weight from the fractional grid indices
         wx = ix - x0.to(self.dtype)
         wy = iy - y0.to(self.dtype)
 
@@ -264,10 +296,9 @@ class Wave_tracing():
         if position.ndim == 1:
             position = position.unsqueeze(0)
 
-        n_rays = position.shape[0]
-
+        # Initialize the tensor holding the starting angles 
         theta = torch.as_tensor(theta, dtype=dtype, device=device)
-        theta = torch.broadcast_to(theta, (n_rays,))
+        theta = torch.broadcast_to(theta, (self.nb_wave_rays,))
 
         target = torch.full_like(theta, 2 * torch.pi / T)
 
@@ -280,21 +311,30 @@ class Wave_tracing():
 
         # Initial validity check.
         valid = (torch.isfinite(position).all(dim=1)
-                  & torch.isfinite(theta)
-                  & torch.isfinite(d)
-                  & (d > 0)
-                  & torch.isfinite(U).all(dim=1))
+                 & torch.isfinite(theta)
+                 & torch.isfinite(d)
+                 & (d > 0)
+                 & torch.isfinite(U).all(dim=1))
 
-        # Normalize propagation direction using the inverse metric.
-        direction = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
+        # Initialize physical propagation direction.
+        direction_physical = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
 
+        # Find inverse metric tensor.
         gmj = self.metric.find_gmj(position)
 
+        # Extract diagonal metric components.
+        metric_diag = torch.diagonal(gmj, dim1=-2, dim2=-1)
+
+        # Validate metric.
+        valid &= (torch.isfinite(gmj).all(dim=(1, 2)) & torch.isfinite(metric_diag).all(dim=1) & (metric_diag > 0).all(dim=1))
+
+        # Convert physical direction to coordinate-covariant components.
+        direction = direction_physical / torch.sqrt(metric_diag)
+
+        # Verify physical normalization.
         direction_norm = torch.sqrt(torch.einsum("ni,nj,nij->n", direction, direction, gmj))
 
-        valid &= (torch.isfinite(gmj).all(dim=(1, 2))
-                  & torch.isfinite(direction_norm)
-                  & (direction_norm > 0))
+        valid &= (torch.isfinite(direction_norm) & (direction_norm > 0))
 
         direction = direction / direction_norm.unsqueeze(-1)
 
@@ -331,12 +371,9 @@ class Wave_tracing():
 
         # Expand upper bound independently for each ray.
         for _ in range(64):
-
             omega_high = evaluate_omega(k_high)
-
             finite = torch.isfinite(omega_high)
             alive &= finite
-
             bracketed = alive & (omega_high >= target)
 
             # Stop when every remaining ray is bracketed.
@@ -363,23 +400,19 @@ class Wave_tracing():
         if len(ids) == 0:
             return kx, ky
 
+        # Reset validity mask for the remaining rays.
+        alive = torch.ones_like(k_low, dtype=torch.bool)
+
         # Vectorized bisection.
         for _ in range(max_iter):
 
             k_mid = 0.5 * (k_low + k_high)
-
             omega_mid = evaluate_omega(k_mid)
-
             finite = torch.isfinite(omega_mid)
-
             lower_half = finite & (omega_mid < target)
 
             k_low = torch.where(lower_half, k_mid, k_low)
-            k_high = torch.where(
-                finite & ~lower_half,
-                k_mid,
-                k_high
-            )
+            k_high = torch.where(finite & ~lower_half, k_mid, k_high)
 
             # A ray with a non-finite Omega is discarded.
             alive &= finite
@@ -403,10 +436,6 @@ class Wave_tracing():
         device = self.field.device
         dtype = self.field.dtype
         nb_wave_rays = self.nb_wave_rays
-
-        # --------------------------------------------------
-        # 1. Initial ray positions
-        # --------------------------------------------------
 
         valid_sides = ["left", "right", "top", "bottom"]
 
@@ -455,10 +484,6 @@ class Wave_tracing():
                 if xs.shape != (nb_wave_rays,) or ys.shape != (nb_wave_rays,):
                     raise ValueError("ipx and ipy must each be scalar or have nb_wave_rays values.")
 
-        # --------------------------------------------------
-        # 2. Store initial positions
-        # --------------------------------------------------
-
         b_1 = self.projection.b_1(xs, ys)
         b_2 = self.projection.b_2(xs, ys)
 
@@ -475,10 +500,6 @@ class Wave_tracing():
 
         self.initial_rays[:, :2] = positions
 
-        # --------------------------------------------------
-        # 3. Initial wave directions
-        # --------------------------------------------------
-
         theta0 = torch.as_tensor(theta0, dtype=dtype, device=device)
 
         if theta0.ndim == 0:
@@ -487,19 +508,11 @@ class Wave_tracing():
         if theta0.shape != (nb_wave_rays,):
             raise ValueError("theta0 must be scalar or have nb_wave_rays values.")
 
-        # --------------------------------------------------
-        # 4. Calculate initial wavenumbers
-        # --------------------------------------------------
-
         idt = int(self.velocity_idt[0])
         interpolated = self.interpolate(positions)
         local_U = interpolated[:, 1:3, idt, 0]
 
         kx, ky = self.wave(T=wave_period, theta=theta0, position=positions, idt=idt)
-
-        # --------------------------------------------------
-        # 5. Store initial ray state
-        # --------------------------------------------------
 
         self.initial_rays[:, 2] = kx
         self.initial_rays[:, 3] = ky
@@ -589,6 +602,9 @@ class Wave_tracing():
         nt = self.nt
 
         scheme = self.derivative_scheme
+        active_solver = self.solver if solver is None else solver(
+            lambda rays, idt: scheme.evolution(rays, idt)[0]
+        )
 
         active_ids = torch.arange(nr, dtype=torch.long, device=self.device)
         active_rays = self.initial_rays.clone()
@@ -618,17 +634,15 @@ class Wave_tracing():
             if n == nt - 1:
                 break
 
-            next_rays = active_rays + self.dt* derivative
+            next_rays = active_solver.advance(active_rays, idt, self.dt)
 
             # Check bathymetry at the proposed next position
             next_d, _, _ = scheme.find_U_and_d(next_rays[:, :2], idt)
 
             # Only retain rays in valid water
-            finite = (
-                torch.isfinite(next_rays).all(dim=1)
-                & torch.isfinite(next_d)
-                & (next_d > 0)
-            )
+            finite = (torch.isfinite(next_rays).all(dim=1)
+                       & torch.isfinite(next_d)
+                       & (next_d > self.d_cutoff))
             # Check spatial domain
             inside = self.inside_domain(next_rays[:, :2])
 

@@ -31,45 +31,27 @@ class WaveNumberEvolution():
 
 
 class ODESolver(object):
-    """
-    Based on the work by Langtangen, H.P. DOI = 10.1007/978-3-662-49887-3.
-    Superclass for numerical methods solving scalar and vector ODEs
-      du/dt = f(u, t)
-    Attributes:
-    t: array of time values
-    u: array of solution values (at time points t)
-    k: step number of the most recently computed solution
-    f: callable object implementing f(u, t)
-    """
-    def __init__(self, f):
-        if not callable(f):
-            raise TypeError('f is %s, not a function' % type(f))
-        # For ODE systems, f will often return a list, but
-        # arithmetic operations with f in numerical methods
-        # require that f is an array. Let self.f be a function
-        # that first calls f(u,t) and then ensures that the
-        # result is an array of floats.
-        self.f = lambda u, t: np.asarray(f(u, t), float)
+    def __init__(self, derivative_scheme):
+        if not callable(derivative_scheme):
+            raise TypeError(f'derivative_scheme is {type(derivative_scheme)}, not callable')
+        self.derivative_scheme = derivative_scheme
 
-    def advance(self):
-        """Advance solution one time step."""
+    def advance(self, u, k, t):
         raise NotImplementedError
 
 
-
 class ForwardEuler(ODESolver):
-    def advance(u, f, k, t):
-        dt = t[k+1] - t[k]
-        u_new = u + dt*f(u, t[k])
-        return u_new
+    def advance(self, u, idt, dt):
+        du = self.derivative_scheme(u, idt)
+        return u + dt * du
+
 
 class RungeKutta4(ODESolver):
-    def advance(u, f, k, t):
-        dt = t[k+1] - t[k]
-        dt2 = dt/2.0
-        K1 = dt*f(u, t[k])
-        K2 = dt*f(u + 0.5*K1, t[k] + dt2)
-        K3 = dt*f(u + 0.5*K2, t[k] + dt2)
-        K4 = dt*f(u + K3, t[k] + dt)
-        u_new = u + (1/6.0)*(K1 + 2*K2 + 2*K3 + K4)
-        return u_new
+    def advance(self, u, idt, dt):
+
+        K1 = dt * self.derivative_scheme(u, idt)
+        K2 = dt * self.derivative_scheme(u + 0.5*K1, idt)
+        K3 = dt * self.derivative_scheme(u + 0.5*K2, idt)
+        K4 = dt * self.derivative_scheme(u + K3, idt)
+
+        return u + (K1 + 2*K2 + 2*K3 + K4) / 6.0

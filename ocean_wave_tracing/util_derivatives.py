@@ -79,7 +79,7 @@ class Autoderivative():
 
         sigma = self.find_sigma(properties.k, properties.d)
 
-        dOmega = torch.autograd.grad(Omega.sum(), rays, create_graph=False, allow_unused=False)[0]
+        dOmega = dOmega = torch.autograd.grad(Omega.sum(), rays, create_graph=False, retain_graph=True, allow_unused=False)[0]
         properties.cg = torch.autograd.grad(sigma.sum(), properties.k, create_graph=False, allow_unused=False)[0]
 
         return dOmega, properties

@@ -73,17 +73,17 @@ class Identity():
         ], dim=-2)
 
     def find_K_ji(self, position):
-            N = position.shape[0]
-            #Function for computing the jacobi matrix for converting lat, lon coordinates to Cartesian in stereographic projection
-    
-            J_11 = t.ones(N, dtype=position.dtype, device=position.device)
-            J_12 = t.zeros(N, dtype=position.dtype, device=position.device)
-            J_21 = t.zeros(N, dtype=position.dtype, device=position.device)       
-            J_22 = t.ones(N, dtype=position.dtype, device=position.device)
-            return t.stack([
-                t.stack([J_11, J_12], dim=-1),
-                t.stack([J_21, J_22], dim=-1)
-            ], dim=-2)
+        N = position.shape[0]
+        #Function for computing the jacobi matrix for converting lat, lon coordinates to Cartesian in stereographic projection
+
+        J_11 = t.ones(N, dtype=position.dtype, device=position.device)
+        J_12 = t.zeros(N, dtype=position.dtype, device=position.device)
+        J_21 = t.zeros(N, dtype=position.dtype, device=position.device)       
+        J_22 = t.ones(N, dtype=position.dtype, device=position.device)
+        return t.stack([
+            t.stack([J_11, J_12], dim=-1),
+            t.stack([J_21, J_22], dim=-1)
+        ], dim=-2)
 
 
 # The polar case from Snyder, inherits most from the regular ellipsoid projection:
@@ -131,7 +131,7 @@ class PolarEllipsoidStereographicProjection():
         X = x - self.x_0
         Y = y - self.y_0
         return self.lon_0 + t.atan2(X, -Y)
-    def b_2(self, x, y, max_iter=20):
+    def b_2(self, x, y, max_iter=60):
         X = x - self.x_0
         Y = y - self.y_0
 
