@@ -137,21 +137,14 @@ class PolarEllipsoidStereographicProjection():
 
         rho = t.sqrt(X**2 + Y**2)
 
-        c_target = (
-            rho * t.sqrt(self.q_t) * self.c_t
-            / (self.r_e * t.cos(self.lat_t))
-        )
+        c_target = (rho * t.sqrt(self.q_t) * self.c_t / (self.r_e * t.cos(self.lat_t)))
 
         # Initial spherical estimate
         lat = t.pi/2 - 2*t.atan(c_target)
 
         # Iteratively account for ellipsoid eccentricity
         for _ in range(max_iter):
-            factor = (
-                (1 - self.e*t.sin(lat))
-                / (1 + self.e*t.sin(lat))
-            )**(self.e/2)
-
+            factor = ((1 - self.e*t.sin(lat)) / (1 + self.e*t.sin(lat)))**(self.e/2)
             lat = t.pi/2 - 2*t.atan(c_target * factor)
 
         return lat
@@ -187,7 +180,4 @@ class PolarEllipsoidStereographicProjection():
         ], dim=-2)
 
     def find_K_ji(self, position):
-
-        # function for finding the inverse Jacobi matrix for a given lat, lon coordinate
         return t.linalg.inv(self.find_J_ij(position))
-        

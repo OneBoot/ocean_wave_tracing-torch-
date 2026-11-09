@@ -10,17 +10,38 @@ import json
 #from importlib import resources
 from importlib_resources import files, as_file
 
-from .util_solvers import Advection, WaveNumberEvolution, RungeKutta4
+from .util_solvers import Advection, WaveNumberEvolution, RungeKutta4, ForwardEuler
 from .util_methods import make_xarray_dataArray, to_xarray_ds, check_velocity_field, check_bathymetry
 
 from .util_metric import CartesianMetric, Identity
 from .util_derivatives import Autoderivative#, Autoderivative_ESPG
 import torch
-
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='ocean_wave_tracing.log', level=logging.INFO)
 logging.info('\nStarted')
+
+# Testiing autograd vs finite difference method
+
+# Wrapper for passing diagnostics
+def _make_derivative_rhs(scheme):
+    """Build an RHS callable that forwards optional diagnostic context."""
+    def rhs(rays, idt):
+        return scheme.evolution(rays, idt)[0]
+
+    def set_diagnostic_context(**context):
+        setter = getattr(scheme, "set_diagnostic_context", None)
+        if callable(setter):
+            setter(**context)
+
+    def get_diagnostic_context():
+        getter = getattr(scheme, "get_diagnostic_context", None)
+        return getter() if callable(getter) else {}
+
+    rhs.set_diagnostic_context = set_diagnostic_context
+    rhs.get_diagnostic_context = get_diagnostic_context
+    return rhs
 
 class Wave_tracing():
     """ Class computing the path of ocean wave rays according to the geometrical
@@ -54,10 +75,12 @@ class Wave_tracing():
 
         self.metric = metric
         self.derivative_scheme = derivative_scheme(self)
-        rhs = lambda rays, idt: self.derivative_scheme.evolution(rays, idt)[0]
+        rhs = _make_derivative_rhs(self.derivative_scheme)
+
+        self.termination_records = []
 
         if solver is None:
-            self.solver = RungeKutta4(rhs)
+            self.solver = RungeKutta4(rhs)#ForwardEuler(rhs)
         else:
             self.solver = solver(rhs)
 
@@ -106,7 +129,22 @@ class Wave_tracing():
         dU_dy, dU_dx = torch.gradient(U_t, spacing=(self.dy, self.dx), dim=(-2, -1))
         dV_dy, dV_dx = torch.gradient(V_t, spacing=(self.dy, self.dx), dim=(-2, -1))
 
-
+        """for name, field in {
+            "U": U_t,
+            "V": V_t,
+            "dU_dx": dU_dx,
+            "dU_dy": dU_dy,
+            "dV_dx": dV_dx,
+            "dV_dy": dV_dy,
+        }.items():
+            print(
+                name,
+                "finite:", torch.isfinite(field).all().item(),
+                "NaNs:", torch.isnan(field).sum().item(),
+                "min:", torch.nanmin(field).item(),
+                "max:", torch.nanmax(field).item(),
+            )"""
+     
         # Check the bathymetry and make it into a pytorch compatible tensor
         if d is not None:
             self.d = check_bathymetry(d=d,x=self.x,y=self.y).values
@@ -144,34 +182,38 @@ class Wave_tracing():
 
     #Method for interpolating the field
     
-    def interpolate(self, position):
+    
+    def interpolate(self, position, idt=None):
         """Bilinearly interpolate fields at one or more positions.
 
-        Positions outside the domain return NaNs.
-
-        Returns:
-            Tensor of shape (N, 7, nt_velocity, 1).
+        If idt is supplied, only that temporal snapshot is
+        interpolated. This prevents NaNs in other time snapshots
+        from contaminating autograd gradients.
         """
 
-        # Normalize to a batch: (N, 2).
         if position.ndim == 1:
             position = position.unsqueeze(0)
 
         if position.ndim != 2 or position.shape[1] != 2:
-            raise ValueError(f"Expected positions with shape (N, 2), got {tuple(position.shape)}")
+            raise ValueError(
+                f"Expected positions with shape (N, 2), "
+                f"got {tuple(position.shape)}"
+            )
 
-        # Transform coordinates.
+        if idt is None:
+            field = self.field
+        else:
+            idt = int(idt)
+            if not 0 <= idt < self.field.shape[0]:
+                raise IndexError(f"Invalid velocity timestep: {idt}")
+            field = self.field[idt:idt + 1]
+
         x = self.projection.a_1(position[:, 0], position[:, 1])
         y = self.projection.a_2(position[:, 0], position[:, 1])
 
         x = x.reshape(-1)
         y = y.reshape(-1)
 
-        # Identify positions inside the domain BEFORE clamping.
-        #valid = (torch.isfinite(x) & torch.isfinite(y)
-        #          & (x >= self.domain_X0) & (x <= self.domain_XN) & (y >= self.domain_Y0) & (y <= self.domain_YN))
-        # Numerical tolerance for projection round-tripping.
-        # The tolerance is deliberately small compared with the grid spacing.
         scale = max(
             abs(self.domain_X0.item()),
             abs(self.domain_XN.item()),
@@ -182,8 +224,6 @@ class Wave_tracing():
 
         tol = 1e-8 * scale
 
-        # Identify positions inside the domain, allowing for small
-        # numerical errors introduced by the coordinate transformation.
         valid = (
             torch.isfinite(x)
             & torch.isfinite(y)
@@ -193,45 +233,59 @@ class Wave_tracing():
             & (y <= self.domain_YN + tol)
         )
 
-        # Convert coordinates to fractional grid indices.
-        ix = (x - self.domain_X0) * (self.nx - 1) / (self.domain_XN - self.domain_X0)
-        iy = (y - self.domain_Y0) * (self.ny - 1) / (self.domain_YN - self.domain_Y0)
+        ix = (
+            (x - self.domain_X0)
+            * (self.nx - 1)
+            / (self.domain_XN - self.domain_X0)
+        )
 
-        # Clamp indices so indexing remains safe, including for NaN inputs.
-        ix = torch.nan_to_num(ix, nan=0.0, posinf=0.0, neginf=0.0).clamp(0, self.nx - 1)
-        iy = torch.nan_to_num(iy, nan=0.0, posinf=0.0, neginf=0.0).clamp(0, self.ny - 1)
+        iy = (
+            (y - self.domain_Y0)
+            * (self.ny - 1)
+            / (self.domain_YN - self.domain_Y0)
+        )
 
-        # Compute the lower indices of the gridcell to be interpolated over
+        ix = torch.nan_to_num(
+            ix, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(0, self.nx - 1)
+
+        iy = torch.nan_to_num(
+            iy, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(0, self.ny - 1)
+
         x0 = torch.floor(ix).long()
         y0 = torch.floor(iy).long()
-        # Compute the upper indices of the gridcell to be interpolated over
+
         x1 = (x0 + 1).clamp(max=self.nx - 1)
         y1 = (y0 + 1).clamp(max=self.ny - 1)
-        # retrieve the per-cell weight from the fractional grid indices
+
         wx = ix - x0.to(self.dtype)
         wy = iy - y0.to(self.dtype)
 
-        # self.field shape: (time, field, y, x).
-        f00 = self.field[..., y0, x0]
-        f10 = self.field[..., y0, x1]
-        f01 = self.field[..., y1, x0]
-        f11 = self.field[..., y1, x1]
+        f00 = field[..., y0, x0]
+        f10 = field[..., y0, x1]
+        f01 = field[..., y1, x0]
+        f11 = field[..., y1, x1]
 
         wx = wx[None, None, :]
         wy = wy[None, None, :]
 
-        result = ((1 - wx) * (1 - wy) * f00
-                   + wx * (1 - wy) * f10
-                   + (1 - wx) * wy * f01
-                   + wx * wy * f11)
+        result = (
+            (1 - wx) * (1 - wy) * f00
+            + wx * (1 - wy) * f10
+            + (1 - wx) * wy * f01
+            + wx * wy * f11
+        )
 
-        # Convert (time, field, N) to (N, field, time, 1).
         result = result.permute(2, 1, 0).unsqueeze(-1)
 
-        # Replace every interpolated field with NaN for invalid positions.
-        result = result.masked_fill((~valid)[:, None, None, None], float("nan"))
+        result = result.masked_fill(
+            (~valid)[:, None, None, None],
+            float("nan")
+        )
 
         return result
+
 
     def check_CFL(self, cg, max_speed):
         """ Method for checking the Courant, Friedrichs, and Lewy
@@ -386,6 +440,7 @@ class Wave_tracing():
         # Verify the final upper bound.
         omega_high = evaluate_omega(k_high)
 
+        # Filter out non-finite and those for which omega_high returns larger than the target
         alive &= torch.isfinite(omega_high)
         alive &= omega_high >= target
 
@@ -509,8 +564,8 @@ class Wave_tracing():
             raise ValueError("theta0 must be scalar or have nb_wave_rays values.")
 
         idt = int(self.velocity_idt[0])
-        interpolated = self.interpolate(positions)
-        local_U = interpolated[:, 1:3, idt, 0]
+        interpolated = self.interpolate(positions, idt=idt)
+        local_U = interpolated[:, 1:3, 0, 0]
 
         kx, ky = self.wave(T=wave_period, theta=theta0, position=positions, idt=idt)
 
@@ -602,14 +657,75 @@ class Wave_tracing():
         nt = self.nt
 
         scheme = self.derivative_scheme
-        active_solver = self.solver if solver is None else solver(
-            lambda rays, idt: scheme.evolution(rays, idt)[0]
-        )
+        active_solver = self.solver if solver is None else solver(lambda rays, idt: scheme.evolution(rays, idt)[0])
+        
+        # Start with all original ray IDs and initial states
+        all_ids = torch.arange(nr, dtype=torch.long, device=self.device)
+        all_rays = self.initial_rays.clone()
 
-        active_ids = torch.arange(nr, dtype=torch.long, device=self.device)
-        active_rays = self.initial_rays.clone()
+        # Check bathymetry BEFORE evaluating any ray derivatives.
+        idt0 = int(self.velocity_idt[0])
+
+        initial_d, _, _ = scheme.find_U_and_d(all_rays[:, :2], idt0)
+
+        initial_inside = self.inside_domain(all_rays[:, :2])
+        initial_wet = torch.isfinite(initial_d) & (initial_d > self.d_cutoff)
+
+        # Rays over land, in shallow water, or outside the domain
+        # are terminated before the first RK4 evaluation.
+        initial_valid = initial_inside & initial_wet
+
+        # Record initial termination reasons
+        for i in torch.where(~initial_valid)[0]:
+
+            reasons = []
+
+            if not torch.isfinite(initial_d[i]):
+                reasons.append("Non-finite bathymetry (land)")
+
+            elif initial_d[i] <= self.d_cutoff:
+                reasons.append(
+                    f"Depth below cutoff: {initial_d[i].item():.6f}"
+                )
+
+            if not initial_inside[i]:
+                reasons.append("Ray outside spatial domain")
+
+            self.termination_records.append({
+                "ray_id": int(all_ids[i].item()),
+                "timestep": 0,
+                "position": all_rays[i, :2].detach().cpu().tolist(),
+                "wavenumber": all_rays[i, 2:].detach().cpu().tolist(),
+                "depth": float(initial_d[i].item()),
+                "reasons": reasons,
+            })
+
+        # Keep only rays initialized in valid water.
+        active_ids = all_ids[initial_valid]
+        active_rays = all_rays[initial_valid].detach()
+
+        # Wet rays must have valid initial wavenumbers.
+        bad_k = ~torch.isfinite(active_rays[:, 2:]).all(dim=1)
+
+        if bad_k.any():
+            bad_ids = active_ids[bad_k]
+
+            raise RuntimeError(
+                "Invalid initial wavenumbers for rays in valid water. "
+                f"Original ray IDs: {bad_ids.tolist()}"
+            )
+
+        # Track surviving original ray IDs.
+        self.active_ray_indices = [active_ids.clone()]
+
+
+        set_diagnostic_context = getattr(scheme, "set_diagnostic_context", None)
 
         for n in range(nt):
+
+            if callable(set_diagnostic_context):
+                set_diagnostic_context(timestep=n + 1, stage="CURRENT", ray_ids=active_ids)
+
             #check if any rays still exist at all
             if len(active_ids) == 0:
                 break
@@ -631,38 +747,101 @@ class Wave_tracing():
             # Store properties at the time they were evaluated.
             self.store_ray_properties(timestep=n, ray_ids=active_ids, rays=active_rays, properties=properties)
 
-            if n == nt - 1:
+            if n == nt-1:
                 break
+
+
 
             next_rays = active_solver.advance(active_rays, idt, self.dt)
 
             # Check bathymetry at the proposed next position
+            # Evaluate bathymetry at proposed next positions
             next_d, _, _ = scheme.find_U_and_d(next_rays[:, :2], idt)
 
-            # Only retain rays in valid water
-            finite = (torch.isfinite(next_rays).all(dim=1)
-                       & torch.isfinite(next_d)
-                       & (next_d > self.d_cutoff))
+            # Individual validity conditions
+            finite_state = torch.isfinite(next_rays).all(dim=1)
+            finite_depth = torch.isfinite(next_d)
+            deep_enough = next_d > self.d_cutoff
+
             # Check spatial domain
             inside = self.inside_domain(next_rays[:, :2])
 
-            # Retain only valid rays
-            valid = inside & finite
+            # Overall validity
+            valid = finite_state & finite_depth & deep_enough & inside
 
+            # Record termination reasons for every removed ray
+            terminated = ~valid
+            terminated_indices = torch.where(terminated)[0]
+
+            for i in terminated_indices:
+                reasons = []
+                if not torch.isfinite(derivative[i]).all():
+                    reasons.append(
+                        f"Non-finite time derivative: "
+                        f"dx/dt={derivative[i, 0].item()}, "
+                        f"dy/dt={derivative[i, 1].item()}, "
+                        f"dkx/dt={derivative[i, 2].item()}, "
+                        f"dky/dt={derivative[i, 3].item()}"
+                    )
+
+                elif derivative[i].abs().max() > 1e6:
+                    reasons.append(
+                        f"Extremely large time derivative: "
+                        f"dx/dt={derivative[i, 0].item()}, "
+                        f"dy/dt={derivative[i, 1].item()}, "
+                        f"dkx/dt={derivative[i, 2].item()}, "
+                        f"dky/dt={derivative[i, 3].item()}"
+                    )
+
+                if not finite_state[i]:
+                    reasons.append("Non-finite ray state (x, y, kx, ky)")
+
+                if not finite_depth[i]:
+                    reasons.append("Non-finite bathymetry")
+
+                if finite_depth[i] and not deep_enough[i]:
+                    reasons.append(
+                        f"Depth below cutoff: depth={next_d[i].item():.6f}, "
+                        f"cutoff={self.d_cutoff}"
+                    )
+
+                if not inside[i]:
+                    reasons.append("Ray outside spatial domain")
+
+                record = {
+                    "ray_id": int(active_ids[i].item()),
+                    "timestep": n + 1,
+                    "position": next_rays[i, :2].detach().cpu().tolist(),
+                    "wavenumber": next_rays[i, 2:].detach().cpu().tolist(),
+                    "depth": float(next_d[i].item()),
+                    "reasons": reasons,
+                    "derivative": derivative[i].detach().cpu().tolist(),
+                    "derivative_finite": bool(torch.isfinite(derivative[i]).all()),
+                    "max_abs_derivative": float(
+                        torch.nan_to_num(
+                            derivative[i].abs(),
+                            nan=float("inf"),
+                            posinf=float("inf"),
+                            neginf=float("inf")
+                        ).max().item()
+                    ),
+                }
+
+                self.termination_records.append(record)
+
+                if n > 0:
+                    logger.warning(f"RAY TERMINATED: ID={record['ray_id']}, "
+                                   f"timestep={record['timestep']}, "
+                                   f"reasons={reasons}")
+
+            # Keep only surviving rays
             active_ids = active_ids[valid]
             active_rays = next_rays[valid].detach()
 
-            # Store only surviving rays
-            if len(active_ids) > 0:
-                self.rays_history[n + 1, active_ids] = active_rays
-            
-            # Remove rays with any non-finite state component.
-            #valid = torch.isfinite(next_rays).all(dim=1)
+            assert len(active_ids) == len(active_rays)
 
-            #active_ids = active_ids[valid]
-            #active_rays = next_rays[valid].detach()
+            self.active_ray_indices.append(active_ids.clone())
 
-            # Store the new positions at the next timestep.
             if len(active_ids) > 0:
                 self.rays_history[n + 1, active_ids] = active_rays
 
