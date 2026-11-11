@@ -1,5 +1,7 @@
 import torch as t
+import logging
 
+logger = logging.getLogger(__name__)
 # The classes in this document define either the inverse metric tensor for the coordinate system of interest
 # or Jacobians for converting between them
 
@@ -180,4 +182,20 @@ class PolarEllipsoidStereographicProjection():
         ], dim=-2)
 
     def find_K_ji(self, position):
-        return t.linalg.inv(self.find_J_ij(position))
+        J = self.find_J_ij(position).double().clone()
+
+        # Implement simple vectorized inversion of the Jacobian 
+        a = J[:, 0, 0]
+        b = J[:, 0, 1]
+        c = J[:, 1, 0]
+        d = J[:, 1, 1]
+
+        det = a * d - b * c
+        K = t.empty_like(J)
+
+        K[:, 0, 0] = d / det
+        K[:, 0, 1] = -b / det
+        K[:, 1, 0] = -c / det
+        K[:, 1, 1] = a / det
+        
+        return K
