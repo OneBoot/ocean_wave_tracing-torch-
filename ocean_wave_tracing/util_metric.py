@@ -91,19 +91,21 @@ class Identity():
 # The polar case from Snyder, inherits most from the regular ellipsoid projection:
 class PolarEllipsoidStereographicProjection():
     def __init__(self, lat_0=t.pi/2, lat_t=t.pi*2/3, lon_0=0, 
-                 x_0=0, y_0=0, a=6378137, b=6356752.3142):
+                 x_0=0, y_0=0, a=6378137, b=6356752.3142, device="cpu", dtype=t.float64):
+        self.dtype = dtype
+        self.device = device
         
-        self.lat_0 = t.tensor(lat_0)
-        self.lon_0 = t.tensor(lon_0)
-        self.lat_t = t.tensor(lat_t)
+        self.lat_0 = t.tensor(lat_0, dtype=self.dtype, device=self.device)
+        self.lon_0 = t.tensor(lon_0, dtype=self.dtype, device=self.device)
+        self.lat_t = t.tensor(lat_t, dtype=self.dtype, device=self.device)
 
-        self.x_0 = t.tensor(x_0)
-        self.y_0 = t.tensor(y_0)
-        self.r_e = t.tensor(a)
+        self.x_0 = t.tensor(x_0, dtype=self.dtype, device=self.device)
+        self.y_0 = t.tensor(y_0, dtype=self.dtype, device=self.device)
+        self.r_e = t.tensor(a, dtype=self.dtype, device=self.device)
 
         # calculate the eccentricity e
         assert a > b, "a should be larger than b"
-        self.e = t.sqrt(1 - (t.tensor(b)**2) / (self.r_e**2))
+        self.e = t.sqrt(1 - (t.tensor(b, dtype=self.dtype, device=self.device)**2) / (self.r_e**2))
 
         # calculate scale factor for true-scale latitude
         self.c_t = self.c(self.lat_t)

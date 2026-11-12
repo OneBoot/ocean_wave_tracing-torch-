@@ -82,14 +82,12 @@ class Autoderivative():
 
         Omega, properties = self.Omega(rays, idt)
 
-        sigma = self.find_sigma(properties.k, properties.d)
-
         dOmega = torch.autograd.grad(Omega.sum(), rays, create_graph=False, retain_graph=True, allow_unused=False)[0]
-        properties.cg = torch.autograd.grad(sigma.sum(), properties.k, create_graph=False, allow_unused=False)[0]
+        properties.cg = torch.autograd.grad(properties.sigma.sum(), properties.k, create_graph=False, allow_unused=False)[0]
 
-        if not torch.isfinite(dOmega).all():
+        """if not torch.isfinite(dOmega).all():
             properties.d_sigma_dstate = torch.autograd.grad(properties.sigma.sum(), rays, create_graph=False, retain_graph=True, allow_unused=True)[0]
-            properties.d_current_term_dstate = torch.autograd.grad(properties.current_term.sum(), rays, create_graph=False, retain_graph=True, allow_unused=True)[0]
+            properties.d_current_term_dstate = torch.autograd.grad(properties.current_term.sum(), rays, create_graph=False, retain_graph=True, allow_unused=True)[0]"""
 
         return dOmega, properties
 

@@ -86,10 +86,14 @@ class Wave_tracing():
         self.active_ray_indices = [torch.arange(self.nb_wave_rays, device=self.device, dtype=torch.long)]
 
         # specify the space and time domains
-        self.domain_X0 = torch.as_tensor(domain_X0, dtype=self.dtype, device=self.device) # left side
-        self.domain_XN = torch.as_tensor(domain_XN, dtype=self.dtype, device=self.device) # right side
-        self.domain_Y0 = torch.as_tensor(domain_Y0, dtype=self.dtype, device=self.device) # bottom
-        self.domain_YN = torch.as_tensor(domain_YN, dtype=self.dtype, device=self.device) # top
+        self.domain_X0_value = float(domain_X0) # left side
+        self.domain_XN_value = float(domain_XN) # right side
+        self.domain_Y0_value = float(domain_Y0) # bottom
+        self.domain_YN_value = float(domain_YN) # top
+        self.domain_X0 = torch.as_tensor(self.domain_X0_value, dtype=self.dtype, device=self.device) # left side
+        self.domain_XN = torch.as_tensor(self.domain_XN_value, dtype=self.dtype, device=self.device) # right side
+        self.domain_Y0 = torch.as_tensor(self.domain_Y0_value, dtype=self.dtype, device=self.device) # bottom
+        self.domain_YN = torch.as_tensor(self.domain_YN_value, dtype=self.dtype, device=self.device) # top
         self.T = T
 
         #specify whether or not the fields are changable
@@ -107,7 +111,6 @@ class Wave_tracing():
         # make torch tensor of velocity field
         U_t = torch.as_tensor(self.U, dtype=self.dtype, device=self.device)
         V_t = torch.as_tensor(self.V, dtype=self.dtype, device=self.device)
-        Troubleshooted codeeeeeeetgttttrrrrrrrree4444
         # Spatial gradients for every time snapshot
         dU_dy, dU_dx = torch.gradient(U_t, spacing=(self.dy, self.dx), dim=(-2, -1))
         dV_dy, dV_dx = torch.gradient(V_t, spacing=(self.dy, self.dx), dim=(-2, -1))
@@ -174,12 +177,9 @@ class Wave_tracing():
         x = x.reshape(-1)
         y = y.reshape(-1)
 
-        valid = (torch.isfinite(x)
-                 & torch.isfinite(y)
-                 & (x >= self.domain_X0 - self.interpolation_tol)
-                 & (x <= self.domain_XN + self.interpolation_tol)
-                 & (y >= self.domain_Y0 - self.interpolation_tol)
-                 & (y <= self.domain_YN + self.interpolation_tol))
+        valid = (torch.isfinite(x) & torch.isfinite(y) 
+                 & (x >= self.domain_X0 - self.interpolation_tol) & (x <= self.domain_XN + self.interpolation_tol) 
+                 & (y >= self.domain_Y0 - self.interpolation_tol) & (y <= self.domain_YN + self.interpolation_tol))
 
         ix = ((x - self.domain_X0)*(self.nx - 1)/(self.domain_XN - self.domain_X0))
         iy = ((y - self.domain_Y0)*(self.ny - 1)/(self.domain_YN - self.domain_Y0))
@@ -258,14 +258,9 @@ class Wave_tracing():
         # Small tolerance in projected coordinates (metres)
         margin = 100.0  # Start with 100 m; adjust after checking diagnostics
 
-        return (
-            torch.isfinite(x)
-            & torch.isfinite(y)
-            & (x >= self.domain_X0 - margin)
-            & (x <= self.domain_XN + margin)
-            & (y >= self.domain_Y0 - margin)
-            & (y <= self.domain_YN + margin)
-        )
+        return (torch.isfinite(x) & torch.isfinite(y) 
+                & (x >= self.domain_X0 - margin) & (x <= self.domain_XN + margin) 
+                & (y >= self.domain_Y0 - margin) & (y <= self.domain_YN + margin))
     
 
     def wave(self, T, theta, position, idt=0, max_iter=80):
@@ -363,8 +358,8 @@ class Wave_tracing():
             bracketed = alive & (omega_high >= target)
 
             # Stop when every remaining ray is bracketed.
-            if torch.all(bracketed | ~alive):
-                break
+            """if torch.all(bracketed | ~alive):
+                break"""
 
             increase = alive & ~bracketed
             k_high = torch.where(increase, 2.0 * k_high, k_high)
@@ -412,7 +407,6 @@ class Wave_tracing():
 
         kx[successful_ids] = k_components[alive, 0]
         ky[successful_ids] = k_components[alive, 1]
-
         return kx, ky
     
 
@@ -433,16 +427,16 @@ class Wave_tracing():
                 side = "left"
 
             if side in ("left", "right"):
-                x_value = self.domain_X0 if side == "left" else self.domain_XN
+                x_value = self.domain_X0_value if side == "left" else self.domain_XN_value
 
-                xs = torch.full((nb_wave_rays,), x_value.item(), dtype=dtype, device=device)
-                ys = torch.linspace(self.domain_Y0.item(), self.domain_YN.item(), nb_wave_rays, dtype=dtype, device=device)
+                xs = torch.full((nb_wave_rays,), x_value, dtype=dtype, device=device)
+                ys = torch.linspace(self.domain_Y0_value, self.domain_YN_value, nb_wave_rays, dtype=dtype, device=device)
 
             else:
-                y_value = self.domain_Y0 if side == "bottom" else self.domain_YN
+                y_value = self.domain_Y0_value if side == "bottom" else self.domain_YN_value
 
-                xs = torch.linspace(self.domain_X0.item(), self.domain_XN.item(), nb_wave_rays, dtype=dtype, device=device)
-                ys = torch.full((nb_wave_rays,), y_value.item(), dtype=dtype, device=device)
+                xs = torch.linspace(self.domain_X0_value, self.domain_XN_value, nb_wave_rays, dtype=dtype, device=device)
+                ys = torch.full((nb_wave_rays,), y_value, dtype=dtype, device=device)
 
         else:
             ipx = kwargs.get("ipx")
@@ -451,8 +445,8 @@ class Wave_tracing():
             if ipx is None and ipy is None:
                 logger.info("No initial positions given. Using left boundary.")
 
-                xs = torch.full((nb_wave_rays,), self.domain_X0.item(), dtype=dtype, device=device)
-                ys = torch.linspace(self.domain_Y0.item(), self.domain_YN.item(), nb_wave_rays, dtype=dtype, device=device)
+                xs = torch.full((nb_wave_rays,), self.domain_X0_value, dtype=dtype, device=device)
+                ys = torch.linspace(self.domain_Y0_value, self.domain_YN_value, nb_wave_rays, dtype=dtype, device=device)
 
             else:
                 if ipx is None or ipy is None:
@@ -597,14 +591,13 @@ class Wave_tracing():
         # Check bathymetry BEFORE evaluating any ray derivatives.
         idt0 = int(self.velocity_idt[0])
 
-        initial_d, _, _ = scheme.find_U_and_d(all_rays[:, :2], idt0)
+        initial_d, initial_U, _ = scheme.find_U_and_d(all_rays[:, :2], idt0)
 
         initial_inside = self.inside_domain(all_rays[:, :2])
-        initial_wet = torch.isfinite(initial_d) & (initial_d > self.d_cutoff)
+        initial_wet = (torch.isfinite(initial_d) & (initial_d > self.d_cutoff))
+        initial_current_valid = torch.isfinite(initial_U).all(dim=1)
 
-        # Rays over land, in shallow water, or outside the domain
-        # are terminated before the first RK4 evaluation.
-        initial_valid = initial_inside & initial_wet
+        initial_valid = (initial_inside & initial_wet & initial_current_valid)
 
         # Keep only rays initialized in valid water.
         active_ids = all_ids[initial_valid]
@@ -802,8 +795,8 @@ class Wave_tracing():
     def to_latlon(self, proj4):
         """Reproject ray coordinates to longitude and latitude."""
 
-        ray_x = np.asarray(self.ray_x).T
-        ray_y = np.asarray(self.ray_y).T
+        ray_x = np.asarray(self.ray_x.cpu()).T
+        ray_y = np.asarray(self.ray_y.cpu()).T
 
         # Current layout: (time, ray)
         expected_shape = (self.nt, self.nb_wave_rays)
